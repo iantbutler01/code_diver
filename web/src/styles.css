@@ -1,0 +1,389 @@
+:root {
+  --bg: #0f0f1a;
+  --surface: #16213e;
+  --surface-hover: #1a2745;
+  --ink: #e0e0e0;
+  --muted: #8892a4;
+  --line: #2a3a5c;
+  --accent: #0f9b8e;
+  --accent-hover: #12b5a5;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-family: "Inter", "SF Pro", -apple-system, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+/* App layout */
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;
+}
+
+.app-title {
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.02em;
+}
+
+.app-root {
+  font-size: 0.78rem;
+  color: var(--muted);
+  font-family: "SF Mono", "Fira Code", monospace;
+}
+
+.app-live {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: pulse 2s infinite;
+}
+
+/* Breadcrumb */
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--line);
+  font-size: 0.85rem;
+  flex-shrink: 0;
+  background: rgba(22, 33, 62, 0.5);
+}
+
+.crumb {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: inherit;
+  padding: 2px 6px;
+  border-radius: 3px;
+  transition: background 120ms;
+}
+
+.crumb:hover {
+  background: rgba(15, 155, 142, 0.12);
+}
+
+.crumb-current {
+  color: var(--ink);
+  font-weight: 600;
+  cursor: default;
+}
+
+.crumb-sep {
+  color: var(--muted);
+  margin: 0 4px;
+}
+
+/* Graph canvas takes remaining space */
+.graph-canvas {
+  flex: 1;
+  min-height: 0;
+}
+
+.loading, .error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.error {
+  color: #ef4444;
+}
+
+/* Custom nodes */
+.node {
+  padding: 12px 16px;
+  border-radius: 8px;
+  border: 1.5px solid var(--line);
+  background: var(--surface);
+  min-width: 200px;
+  max-width: 280px;
+  cursor: pointer;
+  transition: border-color 150ms, box-shadow 150ms;
+}
+
+.node:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 12px rgba(15, 155, 142, 0.2);
+}
+
+.node-group {
+  border-color: #8b5cf6;
+  border-left: 3px solid #8b5cf6;
+  min-width: 240px;
+  max-width: 320px;
+}
+
+.node-group:hover {
+  border-color: #a78bfa;
+  box-shadow: 0 0 16px rgba(139, 92, 246, 0.25);
+}
+
+.node-group-title {
+  font-weight: 700;
+  font-size: 1rem;
+  color: #a78bfa;
+  font-family: "SF Mono", "Fira Code", monospace;
+  margin-bottom: 2px;
+}
+
+.node-group-count {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.node-group-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.node-group-item {
+  font-size: 0.72rem;
+  color: var(--ink);
+  padding: 2px 8px;
+  background: rgba(139, 92, 246, 0.08);
+  border-radius: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-group-more {
+  color: var(--muted);
+  font-style: italic;
+  background: none;
+}
+
+.node-file-group {
+  border-color: #6366f1;
+  border-left: 3px solid #6366f1;
+  min-width: 260px;
+  max-width: 380px;
+}
+
+.node-file-group:hover {
+  border-color: #818cf8;
+  box-shadow: 0 0 14px rgba(99, 102, 241, 0.25);
+}
+
+.node-concepts {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.node-concept {
+  font-size: 0.72rem;
+  padding: 4px 8px;
+  background: rgba(99, 102, 241, 0.08);
+  border-radius: 3px;
+}
+
+.node-concept-name {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.node-concept-desc {
+  font-size: 0.68rem;
+  color: var(--muted);
+  line-height: 1.35;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  white-space: normal;
+}
+
+.node-tags {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.node-tag-item {
+  font-size: 0.68rem;
+  line-height: 1.35;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.node-tag-line {
+  color: #f59e0b;
+  font-family: "SF Mono", "Fira Code", monospace;
+  font-size: 0.65rem;
+  flex-shrink: 0;
+}
+
+.node-tag-text {
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-component {
+  border-color: var(--accent);
+  border-left: 3px solid var(--accent);
+}
+
+.node-file {
+  border-color: #3b82f6;
+  border-left: 3px solid #3b82f6;
+}
+
+.node-file-header {
+  border-color: var(--accent);
+  border-left: 3px solid var(--accent);
+  background: rgba(15, 155, 142, 0.08);
+}
+
+.node-tag {
+  border-color: #f59e0b;
+  border-left: 3px solid #f59e0b;
+}
+
+.node-file-ref {
+  border-color: #f59e0b;
+  border-left: 3px solid #f59e0b;
+  border-style: dashed;
+  opacity: 0.85;
+}
+
+.node-rels {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+
+.node-rel {
+  font-size: 0.7rem;
+  color: #f59e0b;
+  font-family: "SF Mono", "Fira Code", monospace;
+  line-height: 1.4;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.node-title {
+  font-weight: 600;
+  font-size: 0.9rem;
+  margin-bottom: 2px;
+}
+
+.node-desc {
+  font-size: 0.78rem;
+  color: var(--muted);
+  line-height: 1.35;
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+}
+
+.node-path {
+  font-size: 0.72rem;
+  color: var(--accent);
+  font-family: "SF Mono", "Fira Code", monospace;
+  margin-top: 4px;
+}
+
+.node-line {
+  font-size: 0.72rem;
+  color: #f59e0b;
+  font-family: "SF Mono", "Fira Code", monospace;
+  margin-bottom: 2px;
+}
+
+.node-hint {
+  font-size: 0.68rem;
+  color: var(--muted);
+  margin-top: 6px;
+  opacity: 0.6;
+  font-style: italic;
+}
+
+/* React Flow overrides for dark theme */
+.react-flow__attribution {
+  display: none;
+}
+
+.react-flow__edge-textbg {
+  fill: var(--surface);
+}
+
+.react-flow__edge-text {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.react-flow__controls {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.react-flow__controls-button {
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+  fill: var(--muted);
+}
+
+.react-flow__controls-button:hover {
+  background: var(--surface-hover);
+}
+
+.react-flow__minimap {
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
