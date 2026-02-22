@@ -18,6 +18,7 @@ interface FileGroupData {
   diveRels: string[];
   tags: Tag[];
   tagCount: number;
+  isSummary?: boolean;
 }
 
 export function FileGroupNode({ data }: NodeProps) {
@@ -49,7 +50,7 @@ export function FileGroupNode({ data }: NodeProps) {
           ))}
         </div>
       )}
-      {d.tags && d.tags.length > 0 && (
+      {!d.isSummary && d.tags && d.tags.length > 0 && (
         <div className="node-tags">
           {d.tags.map((t) => (
             <div key={t.line} className="node-tag-item">
@@ -59,10 +60,13 @@ export function FileGroupNode({ data }: NodeProps) {
           ))}
         </div>
       )}
-      {d.tagCount > 0 && (
+      {!d.isSummary && d.tagCount > 0 && (
         <div className="node-hint">{d.tagCount} tags - click to explore</div>
       )}
-      {d.tagCount === 0 && (
+      {!d.isSummary && d.tagCount === 0 && (
+        <div className="node-hint">click to open in VS Code</div>
+      )}
+      {d.isSummary && (
         <div className="node-hint">click to open in VS Code</div>
       )}
       <Handle type="source" position={Position.Bottom} />

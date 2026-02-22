@@ -58,8 +58,10 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         // Subsystem group: drill into filtered system view
         onNavigate({ level: "system", label: d.name, id: d.groupId });
       } else if (node.type === "filegroup") {
-        // File group (multiple concepts in one file)
-        if (d.tagCount > 0) {
+        if (d.isSummary) {
+          // Summary node in file view: open in VS Code
+          if (d.absPath) openInVscode(d.absPath, 1);
+        } else if (d.tagCount > 0) {
           const fileName = d.path.split("/").pop() || d.path;
           onNavigate({ level: "file", label: fileName, id: d.path });
         } else if (d.absPath) {

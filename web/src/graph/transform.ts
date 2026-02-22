@@ -621,6 +621,33 @@ function fileLevel(
   );
   if (!file) return { nodes, edges };
 
+  // Add parent summary node with overview concepts targeting this file
+  const concepts = findConceptsForFile(data, file.path);
+  if (concepts.length > 0) {
+    const summaryId = `summary:${file.path}`;
+    nodes.push({
+      id: summaryId,
+      type: "filegroup",
+      position: { x: 0, y: 0 },
+      data: {
+        path: file.path,
+        absPath: file.abs_path,
+        concepts,
+        diveFile: file.dive_file || "",
+        diveRels: file.dive_rel,
+        tags: [],
+        tagCount: file.tags.length,
+        isSummary: true,
+      },
+    });
+
+    edges.push({
+      id: `e-summary-file`,
+      source: summaryId,
+      target: `file:${file.path}`,
+    });
+  }
+
   nodes.push({
     id: `file:${file.path}`,
     type: "file",
@@ -691,6 +718,22 @@ function fileLevel(
 }
 
 // ─── Helpers ───────────────────────────────────────────────────────────
+
+function findConceptsForFile(
+  data: GraphData,
+  filePath: string
+): { name: string; description: string }[] {
+  if (!data.overview) return [];
+  const results: { name: string; description: string }[] = [];
+  for (const comp of data.overview.components) {
+    const target = cleanTarget(comp.target);
+    if (!target) continue;
+    if (target === filePath || filePath.endsWith(target) || target.endsWith(filePath)) {
+      results.push({ name: comp.name, description: comp.description });
+    }
+  }
+  return results;
+}
 
 function findModuleByTarget(data: GraphData, target: string): ModuleDoc | undefined {
   const t = target.replace(/^\.\//, "");
