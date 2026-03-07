@@ -66,14 +66,14 @@ Current graph connectivity is an informed heuristic blend:
 - static evidence from parser-derived refs/calls/imports (the observed “what”)
 - layout/display policies to keep it explorable
 
-## Code Analysis: What You Already Did vs Next Steps
+## Code Analysis: Already Done vs Next Steps
 
 What is already implemented:
 - Added real parser libraries (Tree-sitter language grammars) instead of regex-only extraction.
 - Added static-analysis payload into the API and frontend graph policy path.
 - Kept `.dive` format untouched and merged it as guidance/hints rather than replacing it.
 
-Next steps we discussed:
+Next steps:
 - Move from file-level inferred edges toward richer graph structure (symbol-level and relation-type aware).
 - Add stronger cross-reference indexing (definitions/references/calls) per language where reliable libraries exist.
 - Improve mid-layer blending logic so semantic hints shape query planning and grouping without hard layer boundaries.
