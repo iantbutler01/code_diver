@@ -5,6 +5,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::{DirEntry, WalkDir};
 
+use crate::static_analysis::{
+    FileStaticFactsInput, StaticAnalysis, analyze_static_file, build_static_analysis,
+};
+
 const IGNORED_DIRS: &[&str] = &[
     ".dive",
     ".git",
@@ -25,6 +29,8 @@ pub struct GraphData {
     pub overview: Option<OverviewDoc>,
     pub modules: Vec<ModuleDoc>,
     pub files: Vec<FileDiveDoc>,
+    pub static_analysis: StaticAnalysis,
+    pub diagnostics: Vec<ParseDiagnostic>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -75,12 +81,24 @@ pub struct DiveTag {
     pub description: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ParseDiagnostic {
+    pub path: String,
+    pub scope: String,
+    pub line: Option<usize>,
+    pub code: String,
+    pub message: String,
+    pub raw: String,
+    pub related: Vec<String>,
+}
+
 pub fn build_graph(project_root: &Path) -> Result<GraphData> {
-    let overview = parse_overview(project_root)?;
-    let mut modules = parse_modules(project_root)?;
+    let (overview, mut diagnostics) = parse_overview(project_root)?;
+    let (mut modules, mut module_diagnostics) = parse_modules(project_root)?;
+    diagnostics.append(&mut module_diagnostics);
     modules.sort_by(|a, b| a.name.cmp(&b.name));
 
-    let mut files = scan_source_files(project_root)?;
+    let (mut files, static_analysis) = scan_source_files(project_root)?;
     files.sort_by(|a, b| a.path.cmp(&b.path));
 
     Ok(GraphData {
@@ -89,24 +107,29 @@ pub fn build_graph(project_root: &Path) -> Result<GraphData> {
         overview,
         modules,
         files,
+        static_analysis,
+        diagnostics,
     })
 }
 
-fn parse_overview(project_root: &Path) -> Result<Option<OverviewDoc>> {
+fn parse_overview(project_root: &Path) -> Result<(Option<OverviewDoc>, Vec<ParseDiagnostic>)> {
     let overview_path = project_root.join(".dive").join("overview.md");
     if !overview_path.exists() {
-        return Ok(None);
+        return Ok((None, Vec::new()));
     }
 
     let raw_markdown = fs::read_to_string(&overview_path)
         .with_context(|| format!("Failed to read {}", overview_path.display()))?;
 
+    let overview_rel = relative_path_string(&overview_path, project_root);
     let mut description_lines = Vec::new();
     let mut components = Vec::new();
     let mut relationships = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut section = MdSection::None;
 
-    for line in raw_markdown.lines() {
+    for (idx, line) in raw_markdown.lines().enumerate() {
+        let line_number = idx + 1;
         let trimmed = line.trim();
 
         // Skip dive tags embedded in metadata files
@@ -132,33 +155,62 @@ fn parse_overview(project_root: &Path) -> Result<Option<OverviewDoc>> {
             MdSection::Components => {
                 if let Some(component) = parse_component_line(trimmed) {
                     components.push(component);
+                } else if !trimmed.is_empty() {
+                    diagnostics.push(ParseDiagnostic {
+                        path: overview_rel.clone(),
+                        scope: "overview.components".to_string(),
+                        line: Some(line_number),
+                        code: "unparsed_component_line".to_string(),
+                        message: "Could not parse component entry".to_string(),
+                        raw: line.to_string(),
+                        related: Vec::new(),
+                    });
                 }
             }
             MdSection::Relationships => {
                 if let Some(item) = parse_bullet_line(trimmed) {
                     relationships.push(item);
+                } else if !trimmed.is_empty() {
+                    diagnostics.push(ParseDiagnostic {
+                        path: overview_rel.clone(),
+                        scope: "overview.relationships".to_string(),
+                        line: Some(line_number),
+                        code: "unparsed_relationship_line".to_string(),
+                        message: "Could not parse relationship bullet".to_string(),
+                        raw: line.to_string(),
+                        related: Vec::new(),
+                    });
                 }
             }
             MdSection::Files => {}
         }
     }
 
-    Ok(Some(OverviewDoc {
-        path: relative_path_string(&overview_path, project_root),
-        description: description_lines.join(" ").trim().to_string(),
-        components,
-        relationships,
-        raw_markdown,
-    }))
+    diagnostics.extend(find_duplicate_component_diagnostics(
+        &overview_rel,
+        &components,
+    ));
+
+    Ok((
+        Some(OverviewDoc {
+            path: overview_rel,
+            description: description_lines.join(" ").trim().to_string(),
+            components,
+            relationships,
+            raw_markdown,
+        }),
+        diagnostics,
+    ))
 }
 
-fn parse_modules(project_root: &Path) -> Result<Vec<ModuleDoc>> {
+fn parse_modules(project_root: &Path) -> Result<(Vec<ModuleDoc>, Vec<ParseDiagnostic>)> {
     let modules_dir = project_root.join(".dive").join("modules");
     if !modules_dir.exists() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     let mut modules = Vec::new();
+    let mut diagnostics = Vec::new();
     for entry in fs::read_dir(&modules_dir)
         .with_context(|| format!("Failed to read {}", modules_dir.display()))?
     {
@@ -171,13 +223,15 @@ fn parse_modules(project_root: &Path) -> Result<Vec<ModuleDoc>> {
         let raw_markdown = fs::read_to_string(&path)
             .with_context(|| format!("Failed to read {}", path.display()))?;
 
+        let module_rel = relative_path_string(&path, project_root);
         let mut description_lines = Vec::new();
         let mut files = Vec::new();
         let mut relationships = Vec::new();
         let mut section = MdSection::None;
         let mut title = String::new();
 
-        for line in raw_markdown.lines() {
+        for (idx, line) in raw_markdown.lines().enumerate() {
+            let line_number = idx + 1;
             let trimmed = line.trim();
 
             // Skip dive tags embedded in metadata files
@@ -204,11 +258,31 @@ fn parse_modules(project_root: &Path) -> Result<Vec<ModuleDoc>> {
                 MdSection::Files => {
                     if let Some(file_entry) = parse_module_file_line(trimmed) {
                         files.push(file_entry);
+                    } else if !trimmed.is_empty() {
+                        diagnostics.push(ParseDiagnostic {
+                            path: module_rel.clone(),
+                            scope: "module.files".to_string(),
+                            line: Some(line_number),
+                            code: "unparsed_module_file_line".to_string(),
+                            message: "Could not parse module file bullet".to_string(),
+                            raw: line.to_string(),
+                            related: Vec::new(),
+                        });
                     }
                 }
                 MdSection::Relationships => {
                     if let Some(item) = parse_bullet_line(trimmed) {
                         relationships.push(item);
+                    } else if !trimmed.is_empty() {
+                        diagnostics.push(ParseDiagnostic {
+                            path: module_rel.clone(),
+                            scope: "module.relationships".to_string(),
+                            line: Some(line_number),
+                            code: "unparsed_relationship_line".to_string(),
+                            message: "Could not parse relationship bullet".to_string(),
+                            raw: line.to_string(),
+                            related: Vec::new(),
+                        });
                     }
                 }
                 MdSection::Components => {}
@@ -228,7 +302,7 @@ fn parse_modules(project_root: &Path) -> Result<Vec<ModuleDoc>> {
             } else {
                 title
             },
-            path: relative_path_string(&path, project_root),
+            path: module_rel,
             description: description_lines.join(" ").trim().to_string(),
             files,
             relationships,
@@ -236,11 +310,12 @@ fn parse_modules(project_root: &Path) -> Result<Vec<ModuleDoc>> {
         });
     }
 
-    Ok(modules)
+    Ok((modules, diagnostics))
 }
 
-fn scan_source_files(project_root: &Path) -> Result<Vec<FileDiveDoc>> {
+fn scan_source_files(project_root: &Path) -> Result<(Vec<FileDiveDoc>, StaticAnalysis)> {
     let mut files_with_tags = Vec::new();
+    let mut static_inputs = Vec::<FileStaticFactsInput>::new();
 
     for entry in WalkDir::new(project_root)
         .into_iter()
@@ -269,13 +344,16 @@ fn scan_source_files(project_root: &Path) -> Result<Vec<FileDiveDoc>> {
         }
 
         let content = String::from_utf8_lossy(&bytes);
+        let rel_path = relative_path_string(entry.path(), project_root);
+        static_inputs.push(analyze_static_file(&rel_path, &content));
+
         let parsed = parse_file_content(entry.path(), &content, project_root);
         if parsed.dive_file.is_some() || !parsed.dive_rel.is_empty() || !parsed.tags.is_empty() {
             files_with_tags.push(parsed);
         }
     }
 
-    Ok(files_with_tags)
+    Ok((files_with_tags, build_static_analysis(&static_inputs)))
 }
 
 fn parse_file_content(path: &Path, content: &str, project_root: &Path) -> FileDiveDoc {
@@ -337,14 +415,9 @@ fn parse_component_line(line: &str) -> Option<ComponentEntry> {
 
     text = remainder.trim_start_matches('-').trim();
 
-    let (description, target) = match split_once_any(text, &[" -> ", " → "]) {
+    let (description, target) = match split_once_any(text, &["->", "→"]) {
         Some((left, right)) => {
-            let target = right.trim();
-            let target = if target.is_empty() {
-                None
-            } else {
-                Some(target.to_string())
-            };
+            let target = normalize_target_token(right);
             (left.trim().to_string(), target)
         }
         None => (text.to_string(), None),
@@ -396,6 +469,22 @@ fn parse_bullet_line(line: &str) -> Option<String> {
     }
     if let Some(rest) = trimmed.strip_prefix("* ") {
         return Some(rest.trim().to_string());
+    }
+    if let Some(rest) = trimmed.strip_prefix("+ ") {
+        return Some(rest.trim().to_string());
+    }
+    let first_non_digit = trimmed
+        .char_indices()
+        .find(|(_, c)| !c.is_ascii_digit())
+        .map(|(idx, _)| idx)?;
+    if first_non_digit > 0 {
+        let after_digits = &trimmed[first_non_digit..];
+        if let Some(rest) = after_digits.strip_prefix(". ") {
+            return Some(rest.trim().to_string());
+        }
+        if let Some(rest) = after_digits.strip_prefix(") ") {
+            return Some(rest.trim().to_string());
+        }
     }
     None
 }
@@ -456,6 +545,111 @@ fn is_dive_tag_line(line: &str) -> bool {
     stripped.starts_with("@dive-file:")
         || stripped.starts_with("@dive-rel:")
         || stripped.starts_with("@dive:")
+}
+
+fn normalize_target_token(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(target) = unwrap_markdown_target(trimmed) {
+        return is_path_like(target).then(|| target.to_string());
+    }
+
+    let cleaned = trimmed
+        .trim_matches('`')
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+fn unwrap_markdown_target(raw: &str) -> Option<&str> {
+    if let Some(inner) = raw.strip_prefix('`').and_then(|s| s.strip_suffix('`')) {
+        return Some(inner.trim());
+    }
+
+    if let Some(inner) = raw.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        return Some(inner.trim());
+    }
+
+    let close_label = raw.find("](")?;
+    if !raw.starts_with('[') || !raw.ends_with(')') {
+        return None;
+    }
+    let target = &raw[close_label + 2..raw.len() - 1];
+    Some(target.trim())
+}
+
+fn is_path_like(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return false;
+    }
+    v.contains('/')
+        || v.contains('\\')
+        || v.contains('.')
+        || v.starts_with("./")
+        || v.starts_with("../")
+}
+
+fn find_duplicate_component_diagnostics(
+    path: &str,
+    components: &[ComponentEntry],
+) -> Vec<ParseDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut groups: std::collections::BTreeMap<String, Vec<&ComponentEntry>> =
+        std::collections::BTreeMap::new();
+
+    for comp in components {
+        groups
+            .entry(normalize_component_name(&comp.name))
+            .or_default()
+            .push(comp);
+    }
+
+    for comps in groups.values() {
+        if comps.len() < 2 {
+            continue;
+        }
+
+        let mut related = Vec::new();
+        for comp in comps {
+            related.push(match &comp.target {
+                Some(t) => format!("{} -> {}", comp.name, t),
+                None => format!("{} -> (no target)", comp.name),
+            });
+        }
+
+        diagnostics.push(ParseDiagnostic {
+            path: path.to_string(),
+            scope: "overview.components".to_string(),
+            line: None,
+            code: "duplicate_component_name".to_string(),
+            message: format!(
+                "Component name '{}' appears {} times",
+                comps[0].name,
+                comps.len()
+            ),
+            raw: comps[0].name.clone(),
+            related,
+        });
+    }
+
+    diagnostics
+}
+
+fn normalize_component_name(name: &str) -> String {
+    name.to_lowercase()
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '_' && *c != '-')
+        .collect()
 }
 
 fn looks_like_comment_prefix(prefix: &str) -> bool {
@@ -563,11 +757,22 @@ enum MdSection {
 
 impl MdSection {
     fn from_heading(line: &str) -> Option<Self> {
-        if !line.starts_with("## ") {
+        let trimmed = line.trim_start();
+        if !trimmed.starts_with('#') {
+            return None;
+        }
+        let level = trimmed.chars().take_while(|c| *c == '#').count();
+        if !(2..=6).contains(&level) {
+            return None;
+        }
+        let Some(rest) = trimmed.get(level..) else {
+            return None;
+        };
+        if !rest.starts_with(' ') {
             return None;
         }
 
-        let heading = line.trim_start_matches("## ").trim().to_lowercase();
+        let heading = rest.trim().to_lowercase();
         if heading.starts_with("components") {
             return Some(Self::Components);
         }
@@ -578,5 +783,70 @@ impl MdSection {
             return Some(Self::Relationships);
         }
         Some(Self::None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn section_parses_multiple_heading_levels() {
+        assert_eq!(
+            MdSection::from_heading("## Components"),
+            Some(MdSection::Components)
+        );
+        assert_eq!(
+            MdSection::from_heading("### Relationships"),
+            Some(MdSection::Relationships)
+        );
+        assert_eq!(
+            MdSection::from_heading("###### Files"),
+            Some(MdSection::Files)
+        );
+        assert_eq!(MdSection::from_heading("# Components"), None);
+    }
+
+    #[test]
+    fn bullet_parser_accepts_common_variants() {
+        assert_eq!(parse_bullet_line("- item"), Some("item".to_string()));
+        assert_eq!(parse_bullet_line("* item"), Some("item".to_string()));
+        assert_eq!(parse_bullet_line("+ item"), Some("item".to_string()));
+        assert_eq!(parse_bullet_line("1. item"), Some("item".to_string()));
+        assert_eq!(parse_bullet_line("12) item"), Some("item".to_string()));
+    }
+
+    #[test]
+    fn component_parser_accepts_arrow_variants_and_wrappers() {
+        let c1 = parse_component_line("- **Control Plane** - routes work->`crates/x/src/lib.rs`")
+            .expect("component should parse");
+        assert_eq!(c1.name, "Control Plane");
+        assert_eq!(c1.target.as_deref(), Some("crates/x/src/lib.rs"));
+
+        let c2 = parse_component_line("- Worker : handles jobs → [target](crates/x/src/worker.rs)")
+            .expect("component should parse");
+        assert_eq!(c2.name, "Worker");
+        assert_eq!(c2.target.as_deref(), Some("crates/x/src/worker.rs"));
+    }
+
+    #[test]
+    fn duplicate_component_diagnostics_are_emitted() {
+        let components = vec![
+            ComponentEntry {
+                name: "Control".to_string(),
+                description: "a".to_string(),
+                target: Some("a.rs".to_string()),
+            },
+            ComponentEntry {
+                name: "Control".to_string(),
+                description: "b".to_string(),
+                target: Some("b.rs".to_string()),
+            },
+        ];
+
+        let diagnostics = find_duplicate_component_diagnostics("x/.dive/overview.md", &components);
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].code, "duplicate_component_name");
+        assert_eq!(diagnostics[0].related.len(), 2);
     }
 }

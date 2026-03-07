@@ -1,14 +1,19 @@
+mod mcp_server;
 mod parser;
+mod static_analysis;
 
-use anyhow::{Context, Result};
-use axum::extract::State;
-use axum::response::sse::{Event as SseEvent, KeepAlive};
+use anyhow::{Context, Result, anyhow};
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::Sse;
+use axum::response::sse::{Event as SseEvent, KeepAlive};
 use axum::routing::get;
 use axum::{Json, Router};
 use clap::Parser;
 use notify::{Config, Event, PollWatcher, RecursiveMode, Watcher};
+use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
+use std::net::{Ipv6Addr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,17 +37,35 @@ struct Cli {
 
     #[arg(short, long, default_value_t = 4000)]
     port: u16,
+
+    #[arg(long, default_value = "127.0.0.1:4100")]
+    mcp_addr: String,
 }
+
+const DEFAULT_MCP_PORT: u16 = 4100;
 
 #[derive(Clone)]
 struct AppState {
+    project_root: PathBuf,
     graph: Arc<RwLock<GraphData>>,
     events: broadcast::Sender<()>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarkdownQuery {
+    path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct MarkdownDoc {
+    path: String,
+    content: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    let mcp_bind_addr = normalize_mcp_bind_addr(&cli.mcp_addr, DEFAULT_MCP_PORT)?;
     let project_root = cli
         .project
         .canonicalize()
@@ -55,6 +78,7 @@ async fn main() -> Result<()> {
     let (events, _) = broadcast::channel(256);
 
     spawn_watcher(project_root.clone(), graph.clone(), events.clone());
+    mcp_server::spawn_mcp_server(mcp_bind_addr.clone(), project_root.clone(), graph.clone());
 
     // Serve the React frontend from web/dist/
     let web_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web/dist");
@@ -62,17 +86,21 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/api/graph", get(graph_handler))
+        .route("/api/markdown", get(markdown_handler))
         .route("/api/events", get(events_handler))
-        .with_state(AppState { graph, events })
-        .fallback_service(
-            ServeDir::new(&web_dir).fallback(ServeFile::new(&index_file)),
-        );
+        .with_state(AppState {
+            project_root: project_root.clone(),
+            graph,
+            events,
+        })
+        .fallback_service(ServeDir::new(&web_dir).fallback(ServeFile::new(&index_file)));
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", cli.port))
         .await
         .with_context(|| format!("Failed to bind 127.0.0.1:{}", cli.port))?;
 
     println!("Code Diver running at http://127.0.0.1:{}/", cli.port);
+    println!("MCP endpoint: http://{}/mcp", mcp_bind_addr);
     println!("Watching: {}", project_root.display());
 
     axum::serve(listener, app).await.context("Server exited")?;
@@ -81,6 +109,73 @@ async fn main() -> Result<()> {
 
 async fn graph_handler(State(state): State<AppState>) -> Json<GraphData> {
     Json(state.graph.read().await.clone())
+}
+
+async fn markdown_handler(
+    State(state): State<AppState>,
+    Query(query): Query<MarkdownQuery>,
+) -> Result<Json<MarkdownDoc>, (StatusCode, String)> {
+    let request_path = query.path.trim();
+    if request_path.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Missing 'path' query parameter".to_string(),
+        ));
+    }
+
+    let joined = state.project_root.join(request_path);
+    let canonical = joined.canonicalize().map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Markdown file not found: {request_path}"),
+        )
+    })?;
+
+    if !canonical.starts_with(&state.project_root) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "Path escapes project root".to_string(),
+        ));
+    }
+
+    if !is_markdown_path(&canonical) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "Only .md and .markdown files are supported".to_string(),
+        ));
+    }
+
+    let metadata = tokio::fs::metadata(&canonical).await.map_err(|_| {
+        (
+            StatusCode::NOT_FOUND,
+            format!("Markdown file not found: {request_path}"),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err((StatusCode::NOT_FOUND, format!("Not a file: {request_path}")));
+    }
+    if metadata.len() > 1_000_000 {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Markdown file is too large to render: {request_path}"),
+        ));
+    }
+
+    let content = tokio::fs::read_to_string(&canonical).await.map_err(|err| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Could not read markdown: {err}"),
+        )
+    })?;
+
+    let rel = canonical
+        .strip_prefix(&state.project_root)
+        .ok()
+        .and_then(|path| path.to_str())
+        .map(|path| path.replace('\\', "/"))
+        .unwrap_or_else(|| request_path.to_string());
+
+    Ok(Json(MarkdownDoc { path: rel, content }))
 }
 
 async fn events_handler(
@@ -189,4 +284,62 @@ fn is_ignored_path(path: &Path, project_root: &Path) -> bool {
     }
 
     false
+}
+
+fn is_markdown_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("md") | Some("markdown")
+    )
+}
+
+fn normalize_mcp_bind_addr(raw: &str, default_port: u16) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(format!("127.0.0.1:{default_port}"));
+    }
+
+    let no_scheme = trimmed
+        .strip_prefix("http://")
+        .or_else(|| trimmed.strip_prefix("https://"))
+        .unwrap_or(trimmed);
+    let authority = no_scheme.split('/').next().unwrap_or("").trim();
+    if authority.is_empty() {
+        return Ok(format!("127.0.0.1:{default_port}"));
+    }
+
+    let normalized = if authority.starts_with('[') {
+        if authority.contains("]:") {
+            authority.to_string()
+        } else {
+            format!("{authority}:{default_port}")
+        }
+    } else {
+        let colon_count = authority.chars().filter(|ch| *ch == ':').count();
+        if colon_count == 0 {
+            format!("{authority}:{default_port}")
+        } else if colon_count == 1 {
+            let (_, maybe_port) = authority.rsplit_once(':').expect("single colon");
+            if !maybe_port.is_empty() && maybe_port.chars().all(|ch| ch.is_ascii_digit()) {
+                authority.to_string()
+            } else {
+                format!("{authority}:{default_port}")
+            }
+        } else if authority.parse::<Ipv6Addr>().is_ok() {
+            format!("[{authority}]:{default_port}")
+        } else {
+            authority.to_string()
+        }
+    };
+
+    normalized.to_socket_addrs().map_err(|err| {
+        anyhow!(
+            "Invalid --mcp-addr '{raw}' (normalized to '{normalized}'): {err}. Use host:port, e.g. 127.0.0.1:{default_port}"
+        )
+    })?;
+
+    Ok(normalized)
 }

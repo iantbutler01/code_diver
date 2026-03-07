@@ -2,6 +2,19 @@ import { useEffect, useState, useCallback } from "react";
 import type { GraphData } from "../types";
 import { fetchGraph, subscribeToUpdates } from "../api";
 
+function normalizeGraph(raw: GraphData): GraphData {
+  return {
+    ...raw,
+    static_analysis: raw.static_analysis || {
+      files_analyzed: 0,
+      file_facts: [],
+      edges: [],
+      truncated: false,
+    },
+    diagnostics: raw.diagnostics || [],
+  };
+}
+
 export function useGraphData() {
   const [data, setData] = useState<GraphData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -9,7 +22,7 @@ export function useGraphData() {
   const load = useCallback(async () => {
     try {
       const g = await fetchGraph();
-      setData(g);
+      setData(normalizeGraph(g));
       setError(null);
     } catch (e) {
       setError(String(e));
@@ -17,9 +30,14 @@ export function useGraphData() {
   }, []);
 
   useEffect(() => {
-    load();
+    const timer = window.setTimeout(() => {
+      void load();
+    }, 0);
     const unsub = subscribeToUpdates(load);
-    return unsub;
+    return () => {
+      window.clearTimeout(timer);
+      unsub();
+    };
   }, [load]);
 
   return { data, error, reload: load };

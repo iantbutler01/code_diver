@@ -6,32 +6,1438 @@ import type {
   FileDiveDoc,
   OverviewDoc,
   ComponentEntry,
+  StaticEdge,
 } from "../types";
+import { graphColors } from "./colors";
 
 const CLUSTER_THRESHOLD = 8;
+const MAX_STATIC_EDGE_INSERTIONS = 9000;
 
-/** Strip markdown backticks and whitespace from component targets. */
+interface ComponentRecord {
+  key: string;
+  sourceIndex: number;
+  name: string;
+  description: string;
+  target: string | null;
+  normName: string;
+}
+
+interface BuildOptions {
+  parentSummary?: {
+    groupId: string;
+    label: string;
+    totalComponents: number;
+    componentNames: string[];
+    folderHints: string[];
+  };
+  fileGroupsAreLeaf?: boolean;
+}
+
+interface ParsedRel {
+  src: string;
+  tgt: string;
+  label: string;
+  raw: string;
+}
+
+interface ComponentGroup {
+  id: string;
+  label: string;
+}
+
+interface EdgeData extends Record<string, unknown> {
+  kind?: "structure" | "relationship";
+  layout?: boolean;
+  bundledCount?: number;
+  ambiguous?: boolean;
+  raw?: string;
+  evidence?: string[];
+  staticKind?: string;
+  staticConfidence?: number;
+  policyScore?: number;
+  policySelected?: boolean;
+  policySuppressed?: boolean;
+  policyReason?: string[];
+}
+
+interface WeightedDirectedEdge {
+  source: string;
+  target: string;
+  weight: number;
+}
+
+interface FlowStats {
+  incoming: number;
+  outgoing: number;
+  degree: number;
+  net: number;
+}
+
+interface PlannerNodeData {
+  name?: string;
+  groupId?: string;
+  path?: string;
+  target?: string | null;
+  moduleId?: string | null;
+  dirPath?: string | null;
+}
+
+interface RelationCandidate {
+  index: number;
+  source: string;
+  target: string;
+  score: number;
+  weight: number;
+  reasons: string[];
+}
+
+const TEST_SEGMENTS = new Set([
+  "test",
+  "tests",
+  "__tests__",
+  "e2e",
+  "integration",
+  "unit",
+  "bench",
+  "benches",
+]);
+
+const SPEC_SEGMENTS = new Set([
+  "spec",
+  "specs",
+]);
+
+const SCRIPT_SEGMENTS = new Set([
+  "script",
+  "scripts",
+  "bin",
+  "tools",
+  "tooling",
+  "hack",
+]);
+
+const DOC_SEGMENTS = new Set([
+  "doc",
+  "docs",
+  "example",
+  "examples",
+  "sample",
+  "samples",
+  "demo",
+  "demos",
+  "tutorial",
+  "tutorials",
+]);
+
+const CONFIG_SEGMENTS = new Set([
+  "config",
+  "configs",
+  ".github",
+  "github",
+  "ci",
+  ".circleci",
+  ".gitlab",
+  "infra",
+  "deploy",
+  "deployment",
+]);
+
+/** Strip common markdown wrappers and whitespace from target tokens. */
 function cleanTarget(t: string | null): string | null {
   if (!t) return null;
-  return t.replace(/^`|`$/g, "").trim() || null;
+  let out = t.trim();
+
+  const mdLink = out.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+  if (mdLink) {
+    out = mdLink[2].trim();
+  }
+
+  if (out.startsWith("`") && out.endsWith("`") && out.length > 1) {
+    out = out.slice(1, -1).trim();
+  }
+
+  if (out.startsWith("<") && out.endsWith(">") && out.length > 1) {
+    out = out.slice(1, -1).trim();
+  }
+
+  out = out.trim();
+  return out || null;
+}
+
+function normalizeName(value: string): string {
+  return value.toLowerCase().replace(/[\s_-]+/g, "");
+}
+
+function unwrapEntityToken(value: string): string {
+  let out = value.trim();
+
+  const mdLink = out.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+  if (mdLink) {
+    out = mdLink[1].trim() || mdLink[2].trim();
+  }
+
+  if (out.startsWith("`") && out.endsWith("`") && out.length > 1) {
+    out = out.slice(1, -1).trim();
+  }
+
+  if (out.startsWith("<") && out.endsWith(">") && out.length > 1) {
+    out = out.slice(1, -1).trim();
+  }
+
+  return out.replace(/^[-–:>\s]+|[-–:<\s]+$/g, "").trim();
+}
+
+function normalizeTargetPath(value: string): string {
+  return value
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/");
+}
+
+function getPathSegments(target: string): string[] {
+  const normalized = normalizeTargetPath(target);
+  return normalized
+    .split("/")
+    .map((segment) => segment.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function hasAnySegment(
+  segments: string[],
+  candidates: Set<string>
+): boolean {
+  return segments.some((segment) => candidates.has(segment));
+}
+
+function classifyComponentGroup(target: string | null): ComponentGroup {
+  if (!target) {
+    return { id: "other", label: "other" };
+  }
+
+  const segments = getPathSegments(target);
+  if (segments.length === 0) {
+    return { id: "other", label: "other" };
+  }
+
+  if (hasAnySegment(segments, TEST_SEGMENTS)) {
+    return { id: "semantic:tests", label: "tests" };
+  }
+
+  if (hasAnySegment(segments, SPEC_SEGMENTS)) {
+    return { id: "semantic:specs", label: "specs" };
+  }
+
+  if (hasAnySegment(segments, SCRIPT_SEGMENTS)) {
+    return { id: "semantic:scripts", label: "scripts" };
+  }
+
+  if (hasAnySegment(segments, DOC_SEGMENTS)) {
+    return { id: "semantic:docs", label: "docs" };
+  }
+
+  if (hasAnySegment(segments, CONFIG_SEGMENTS)) {
+    return { id: "semantic:config", label: "config" };
+  }
+
+  const top = segments[0];
+  if (segments.length === 1 && top.includes(".")) {
+    return { id: "path:root", label: "root" };
+  }
+
+  return { id: `path:${top}`, label: top };
+}
+
+function groupLabelFromId(groupId: string): string {
+  if (groupId === "other") return "other";
+  if (groupId === "semantic:tests") return "tests";
+  if (groupId === "semantic:specs") return "specs";
+  if (groupId === "semantic:scripts") return "scripts";
+  if (groupId === "semantic:docs") return "docs";
+  if (groupId === "semantic:config") return "config";
+  if (groupId.startsWith("path:")) {
+    const label = groupId.slice(5).trim();
+    return label || "root";
+  }
+  return groupId;
+}
+
+function folderHintKeyForTarget(target: string, groupId?: string): string {
+  const segments = getPathSegments(target);
+  if (segments.length === 0) return "root";
+
+  const groupPath = groupId?.startsWith("path:") ? groupId.slice(5) : "";
+  if (groupPath && segments[0] === groupPath) {
+    if (segments.length > 1) return `${segments[0]}/${segments[1]}`;
+    return segments[0];
+  }
+
+  if (segments.length > 1) return `${segments[0]}/${segments[1]}`;
+  return segments[0];
+}
+
+function deriveFolderHints(
+  components: ComponentRecord[],
+  groupId?: string,
+  maxHints = 4
+): string[] {
+  const counts = new Map<string, number>();
+  for (const comp of components) {
+    if (!comp.target) continue;
+    const key = folderHintKeyForTarget(comp.target, groupId);
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+
+  return [...counts.entries()]
+    .sort((a, b) => {
+      if (b[1] !== a[1]) return b[1] - a[1];
+      return a[0].localeCompare(b[0]);
+    })
+    .slice(0, maxHints)
+    .map(([hint, count]) => `${hint}/ (${count})`);
+}
+
+function matchesGroup(comp: ComponentRecord, groupId: string): boolean {
+  const bucket = classifyComponentGroup(comp.target);
+  if (bucket.id === groupId) return true;
+
+  // Backward-compatibility for pre-semantic ids (eg "crates").
+  if (!groupId.includes(":")) {
+    if (!comp.target) return groupId === "other";
+    return comp.target.startsWith(groupId);
+  }
+
+  return false;
+}
+
+function prepareComponents(components: ComponentEntry[]): ComponentRecord[] {
+  return components.map((comp, sourceIndex) => {
+    const target = cleanTarget(comp.target);
+    const normName = normalizeName(comp.name);
+    const key = `${normName}:${target || "(none)"}:${sourceIndex}`;
+    return {
+      key,
+      sourceIndex,
+      name: comp.name,
+      description: comp.description,
+      target,
+      normName,
+    };
+  });
+}
+
+function duplicateNameSet(components: ComponentRecord[]): Set<string> {
+  const counts = new Map<string, number>();
+  for (const comp of components) {
+    counts.set(comp.normName, (counts.get(comp.normName) || 0) + 1);
+  }
+  return new Set(
+    [...counts.entries()]
+      .filter(([, count]) => count > 1)
+      .map(([normName]) => normName)
+  );
+}
+
+function addNameNodeMapping(
+  map: Map<string, Set<string>>,
+  normName: string,
+  nodeId: string
+) {
+  const existing = map.get(normName) || new Set<string>();
+  existing.add(nodeId);
+  map.set(normName, existing);
+}
+
+function addStructuralEdge(edges: Edge[], source: string, target: string) {
+  edges.push({
+    id: `e-struct-${source}-${target}`,
+    source,
+    target,
+    data: {
+      layout: true,
+      kind: "structure",
+    },
+  });
+}
+
+function addRelationshipEdge(
+  edges: Edge[],
+  seen: Set<string>,
+  source: string,
+  target: string,
+  label: string,
+  raw: string,
+  ambiguous: boolean
+) {
+  const normLabel = label.toLowerCase().trim();
+  const key = `${source}->${target}:${normLabel}`;
+  if (seen.has(key)) return;
+  seen.add(key);
+
+  edges.push({
+    id: `e-rel-${seen.size}`,
+    source,
+    target,
+    label,
+    animated: true,
+    style: ambiguous
+      ? { stroke: graphColors.edgeAmbiguous, strokeWidth: 1.5, strokeDasharray: "5,4" }
+      : { stroke: graphColors.edgeRelationship, strokeWidth: 1.5 },
+    data: {
+      layout: false,
+      kind: "relationship",
+      ambiguous,
+      raw,
+      evidence: ["semantic"],
+    },
+  });
+}
+
+function relationLayoutWeight(edge: Edge): number {
+  const data = edge.data as EdgeData | undefined;
+  if (typeof data?.bundledCount === "number" && Number.isFinite(data.bundledCount)) {
+    return Math.max(1, Math.round(data.bundledCount));
+  }
+  return 1;
+}
+
+function relationVisibilityBudget(
+  level: NavEntry["level"],
+  nodeCount: number,
+  relationCount: number
+): number {
+  const n = Math.max(1, nodeCount);
+  const base =
+    level === "system"
+      ? Math.round(n * 1.75)
+      : level === "module"
+        ? Math.round(n * 2.25)
+        : Math.round(n * 3);
+  const floor = level === "system" ? 14 : level === "module" ? 18 : 10;
+  const cap = level === "system" ? 72 : level === "module" ? 120 : 80;
+  return Math.max(floor, Math.min(cap, Math.min(base, relationCount)));
+}
+
+function pathHintForNode(node: Node): string | null {
+  const data = node.data as PlannerNodeData;
+  const rawPath =
+    data.path?.trim() ||
+    data.target?.trim() ||
+    data.dirPath?.trim() ||
+    "";
+  if (!rawPath) return null;
+  const segments = normalizeTargetPath(rawPath)
+    .split("/")
+    .filter(Boolean);
+  if (segments.length === 0) return null;
+  return segments.length >= 2 ? `${segments[0]}/${segments[1]}` : segments[0];
+}
+
+function hasStructuralLayoutEdge(edges: Edge[]): boolean {
+  return edges.some((edge) => {
+    const data = edge.data as EdgeData | undefined;
+    return data?.layout !== false;
+  });
+}
+
+function directedEdgeKey(source: string, target: string): string {
+  return `${source}->${target}`;
+}
+
+function buildFlowStats(
+  component: string[],
+  adjacency: Map<string, Map<string, number>>,
+  directedEdges: WeightedDirectedEdge[]
+): Map<string, FlowStats> {
+  const inComponent = new Set(component);
+  const stats = new Map<string, FlowStats>();
+
+  for (const nodeId of component) {
+    const neighbors = adjacency.get(nodeId);
+    let degree = 0;
+    if (neighbors) {
+      for (const weight of neighbors.values()) {
+        degree += weight;
+      }
+    }
+    stats.set(nodeId, {
+      incoming: 0,
+      outgoing: 0,
+      degree,
+      net: 0,
+    });
+  }
+
+  for (const edge of directedEdges) {
+    if (!inComponent.has(edge.source) || !inComponent.has(edge.target)) continue;
+    const src = stats.get(edge.source);
+    const tgt = stats.get(edge.target);
+    if (!src || !tgt) continue;
+    src.outgoing += edge.weight;
+    tgt.incoming += edge.weight;
+  }
+
+  for (const record of stats.values()) {
+    record.net = record.outgoing - record.incoming;
+  }
+
+  return stats;
+}
+
+function pickBackboneRoot(component: string[], stats: Map<string, FlowStats>): string {
+  const ranked = [...component].sort((a, b) => {
+    const sa = stats.get(a);
+    const sb = stats.get(b);
+    const netA = sa?.net || 0;
+    const netB = sb?.net || 0;
+    if (netA !== netB) return netB - netA;
+
+    const outA = sa?.outgoing || 0;
+    const outB = sb?.outgoing || 0;
+    if (outA !== outB) return outB - outA;
+
+    const degreeA = sa?.degree || 0;
+    const degreeB = sb?.degree || 0;
+    if (degreeA !== degreeB) return degreeB - degreeA;
+
+    return a.localeCompare(b);
+  });
+
+  return ranked[0];
+}
+
+function buildConnectedComponents(
+  nodeIds: string[],
+  adjacency: Map<string, Map<string, number>>
+): string[][] {
+  const remaining = new Set(nodeIds);
+  const components: string[][] = [];
+
+  while (remaining.size > 0) {
+    const seed = remaining.values().next().value as string;
+    remaining.delete(seed);
+
+    const stack = [seed];
+    const component: string[] = [];
+
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (!current) continue;
+      component.push(current);
+      const neighbors = adjacency.get(current);
+      if (!neighbors) continue;
+      for (const neighbor of neighbors.keys()) {
+        if (!remaining.has(neighbor)) continue;
+        remaining.delete(neighbor);
+        stack.push(neighbor);
+      }
+    }
+
+    components.push(component);
+  }
+
+  return components.sort((a, b) => b.length - a.length);
+}
+
+function buildMaxSpanningTree(
+  component: string[],
+  root: string,
+  adjacency: Map<string, Map<string, number>>
+): Array<[string, string]> {
+  const componentSet = new Set(component);
+  const visited = new Set<string>([root]);
+  const tree: Array<[string, string]> = [];
+
+  while (visited.size < componentSet.size) {
+    let best:
+      | {
+          from: string;
+          to: string;
+          weight: number;
+        }
+      | null = null;
+
+    for (const from of visited) {
+      const neighbors = adjacency.get(from);
+      if (!neighbors) continue;
+      for (const [to, weight] of neighbors) {
+        if (!componentSet.has(to) || visited.has(to)) continue;
+        if (
+          !best ||
+          weight > best.weight ||
+          (weight === best.weight &&
+            (from.localeCompare(best.from) < 0 ||
+              (from === best.from && to.localeCompare(best.to) < 0)))
+        ) {
+          best = { from, to, weight };
+        }
+      }
+    }
+
+    if (!best) {
+      const unattached = component
+        .filter((id) => !visited.has(id))
+        .sort((a, b) => a.localeCompare(b))[0];
+      if (!unattached) break;
+
+      const anchor = [...visited].sort((a, b) => a.localeCompare(b))[0];
+      if (!anchor) break;
+      tree.push([anchor, unattached]);
+      visited.add(unattached);
+      continue;
+    }
+
+    tree.push([best.from, best.to]);
+    visited.add(best.to);
+  }
+
+  return tree;
+}
+
+function orientBackboneEdge(
+  a: string,
+  b: string,
+  directedWeights: Map<string, number>,
+  stats: Map<string, FlowStats>
+): { source: string; target: string } {
+  const ab = directedWeights.get(directedEdgeKey(a, b)) || 0;
+  const ba = directedWeights.get(directedEdgeKey(b, a)) || 0;
+
+  if (ab > ba) return { source: a, target: b };
+  if (ba > ab) return { source: b, target: a };
+
+  const sa = stats.get(a);
+  const sb = stats.get(b);
+  const scoreA = (sa?.net || 0) * 100 + (sa?.outgoing || 0) * 10 + (sa?.degree || 0);
+  const scoreB = (sb?.net || 0) * 100 + (sb?.outgoing || 0) * 10 + (sb?.degree || 0);
+
+  if (scoreA > scoreB) return { source: a, target: b };
+  if (scoreB > scoreA) return { source: b, target: a };
+
+  return a.localeCompare(b) <= 0 ? { source: a, target: b } : { source: b, target: a };
+}
+
+function buildRelationBackbone(
+  nodeIds: string[],
+  relationEdges: WeightedDirectedEdge[]
+): Array<{ source: string; target: string }> {
+  if (nodeIds.length < 2 || relationEdges.length === 0) return [];
+
+  const adjacency = new Map<string, Map<string, number>>();
+  const directedWeights = new Map<string, number>();
+  const dedupDirected = new Map<string, WeightedDirectedEdge>();
+
+  const addAdjacency = (from: string, to: string, weight: number) => {
+    const links = adjacency.get(from) || new Map<string, number>();
+    links.set(to, (links.get(to) || 0) + weight);
+    adjacency.set(from, links);
+  };
+
+  for (const edge of relationEdges) {
+    if (edge.source === edge.target) continue;
+    const key = directedEdgeKey(edge.source, edge.target);
+    const existing = dedupDirected.get(key);
+    if (existing) {
+      existing.weight += edge.weight;
+    } else {
+      dedupDirected.set(key, { ...edge });
+    }
+  }
+
+  const dedupEdges = [...dedupDirected.values()];
+  for (const edge of dedupEdges) {
+    const dKey = directedEdgeKey(edge.source, edge.target);
+    directedWeights.set(dKey, (directedWeights.get(dKey) || 0) + edge.weight);
+    addAdjacency(edge.source, edge.target, edge.weight);
+    addAdjacency(edge.target, edge.source, edge.weight);
+  }
+
+  const components = buildConnectedComponents(nodeIds, adjacency);
+  const seenDirected = new Set<string>();
+  const backbone: Array<{ source: string; target: string }> = [];
+
+  for (const component of components) {
+    if (component.length < 2) continue;
+    const stats = buildFlowStats(component, adjacency, dedupEdges);
+    const root = pickBackboneRoot(component, stats);
+    const treePairs = buildMaxSpanningTree(component, root, adjacency);
+
+    for (const [a, b] of treePairs) {
+      const oriented = orientBackboneEdge(a, b, directedWeights, stats);
+      const directed = directedEdgeKey(oriented.source, oriented.target);
+      if (seenDirected.has(directed)) continue;
+      seenDirected.add(directed);
+      backbone.push(oriented);
+    }
+  }
+
+  return backbone;
+}
+
+function plannerHintForNode(node: Node): string | null {
+  const data = node.data as PlannerNodeData;
+  const groupId = data.groupId?.trim();
+  if (groupId) return `group:${groupId}`;
+
+  const rawPath =
+    data.path?.trim() ||
+    data.target?.trim() ||
+    data.dirPath?.trim() ||
+    "";
+  if (rawPath) {
+    const segments = normalizeTargetPath(rawPath)
+      .split("/")
+      .filter(Boolean);
+    if (segments.length >= 2) return `path:${segments[0]}/${segments[1]}`;
+    if (segments.length === 1) return `path:${segments[0]}`;
+  }
+
+  const moduleId = data.moduleId?.trim();
+  if (moduleId) return `module:${moduleId}`;
+
+  const name = data.name?.trim();
+  if (name) return `name:${normalizeName(name)}`;
+
+  return null;
+}
+
+function buildPlannerHintEdges(nodes: Node[]): WeightedDirectedEdge[] {
+  const buckets = new Map<string, Set<string>>();
+  for (const node of nodes) {
+    const hint = plannerHintForNode(node);
+    if (!hint) continue;
+    const set = buckets.get(hint) || new Set<string>();
+    set.add(node.id);
+    buckets.set(hint, set);
+  }
+
+  const hintedEdges: WeightedDirectedEdge[] = [];
+  const representatives: Array<{ id: string; size: number; hint: string }> = [];
+
+  for (const [hint, idsSet] of buckets) {
+    const ids = [...idsSet].sort((a, b) => a.localeCompare(b));
+    if (ids.length === 0) continue;
+    representatives.push({ id: ids[0], size: ids.length, hint });
+    if (ids.length < 2) continue;
+
+    for (let i = 1; i < ids.length; i += 1) {
+      const prev = ids[i - 1];
+      const next = ids[i];
+      hintedEdges.push({ source: prev, target: next, weight: 1 });
+      hintedEdges.push({ source: next, target: prev, weight: 1 });
+    }
+  }
+
+  representatives.sort((a, b) => {
+    if (b.size !== a.size) return b.size - a.size;
+    return a.hint.localeCompare(b.hint);
+  });
+
+  for (let i = 1; i < representatives.length; i += 1) {
+    const prev = representatives[i - 1];
+    const next = representatives[i];
+    hintedEdges.push({ source: prev.id, target: next.id, weight: 1 });
+    hintedEdges.push({ source: next.id, target: prev.id, weight: 1 });
+  }
+
+  return hintedEdges;
+}
+
+function addGeneratedLayoutBackbone(
+  nodes: Node[],
+  edges: Edge[]
+): Edge[] {
+  if (nodes.length < 2 || hasStructuralLayoutEdge(edges)) return edges;
+
+  const nodeIds = nodes.map((node) => node.id);
+  const nodeIdSet = new Set(nodeIds);
+  const hintByNodeId = new Map<string, string | null>();
+  for (const node of nodes) {
+    hintByNodeId.set(node.id, plannerHintForNode(node));
+  }
+
+  const hardEdges = edges
+    .filter((edge) => {
+      const data = edge.data as EdgeData | undefined;
+      return data?.kind === "relationship";
+    })
+    .map((edge) => ({
+      source: edge.source,
+      target: edge.target,
+      weight: relationLayoutWeight(edge),
+    }))
+    .filter((edge) => nodeIdSet.has(edge.source) && nodeIdSet.has(edge.target));
+
+  const relationEdges = hardEdges.map((edge) => {
+    const sourceHint = hintByNodeId.get(edge.source);
+    const targetHint = hintByNodeId.get(edge.target);
+    const sameHint = sourceHint && targetHint && sourceHint === targetHint;
+    return {
+      ...edge,
+      weight: edge.weight + (sameHint ? 1 : 0),
+    };
+  });
+
+  const plannerHintEdges = buildPlannerHintEdges(nodes).filter(
+    (edge) => nodeIdSet.has(edge.source) && nodeIdSet.has(edge.target)
+  );
+
+  const planningEdges =
+    relationEdges.length > 0
+      ? [...relationEdges, ...plannerHintEdges]
+      : plannerHintEdges;
+
+  let backbone = buildRelationBackbone(nodeIds, planningEdges);
+  if (backbone.length === 0 && nodeIds.length > 1) {
+    const chain = [...nodeIds].sort((a, b) => a.localeCompare(b));
+    backbone = [];
+    for (let i = 1; i < chain.length; i += 1) {
+      backbone.push({ source: chain[i - 1], target: chain[i] });
+    }
+  }
+  if (backbone.length === 0) return edges;
+
+  const existingStructural = new Set(
+    edges
+      .filter((edge) => {
+        const data = edge.data as EdgeData | undefined;
+        return data?.layout !== false;
+      })
+      .map((edge) => directedEdgeKey(edge.source, edge.target))
+  );
+
+  const generated: Edge[] = [];
+  let index = 0;
+  for (const edge of backbone) {
+    const key = directedEdgeKey(edge.source, edge.target);
+    if (existingStructural.has(key)) continue;
+    existingStructural.add(key);
+
+    generated.push({
+      id: `e-layout-${edge.source}-${edge.target}-${index}`,
+      source: edge.source,
+      target: edge.target,
+      hidden: true,
+      selectable: false,
+      data: {
+        kind: "structure",
+        layout: true,
+      },
+    });
+    index += 1;
+  }
+
+  if (generated.length === 0) return edges;
+  return [...edges, ...generated];
+}
+
+function relationPairKey(source: string, target: string): string {
+  return `${source}->${target}`;
+}
+
+function buildRelationEdgePairIndex(edges: Edge[]): Map<string, number> {
+  const pairToIndex = new Map<string, number>();
+  for (let i = 0; i < edges.length; i += 1) {
+    const edge = edges[i];
+    const data = edge.data as EdgeData | undefined;
+    if (data?.kind !== "relationship") continue;
+    const key = relationPairKey(edge.source, edge.target);
+    if (!pairToIndex.has(key)) {
+      pairToIndex.set(key, i);
+    }
+  }
+  return pairToIndex;
+}
+
+function edgeEvidence(data: EdgeData | undefined): Set<string> {
+  const values = Array.isArray(data?.evidence) ? data?.evidence : [];
+  return new Set(values.filter((value): value is string => typeof value === "string"));
+}
+
+function isLikelyFilePathToken(value: string): boolean {
+  const normalized = normalizeTargetPath(value);
+  const last = normalized.split("/").pop() || "";
+  if (!last) return false;
+  return /\.[a-z0-9]+$/i.test(last);
+}
+
+function nodePathCandidates(node: Node): string[] {
+  const data = node.data as PlannerNodeData;
+  const candidates = new Set<string>();
+
+  const add = (raw: string | null | undefined) => {
+    if (!raw) return;
+    const normalized = normalizeTargetPath(raw);
+    if (!normalized || !isLikelyFilePathToken(normalized)) return;
+    candidates.add(normalized);
+  };
+
+  add(data.path);
+  add(data.target || undefined);
+
+  return [...candidates];
+}
+
+function buildPathNodeMap(nodes: Node[]): Map<string, Set<string>> {
+  const map = new Map<string, Set<string>>();
+  for (const node of nodes) {
+    for (const path of nodePathCandidates(node)) {
+      const set = map.get(path) || new Set<string>();
+      set.add(node.id);
+      map.set(path, set);
+    }
+  }
+  return map;
+}
+
+function staticEdgeSortScore(edge: StaticEdge): number {
+  return edge.weight * (0.4 + Math.max(0, Math.min(1, edge.confidence)));
+}
+
+function applyEdgeEvidenceStyle(
+  edge: Edge,
+  evidenceSet: Set<string>,
+  ambiguous: boolean,
+  staticConfidence: number
+): Edge {
+  const hasSemantic = evidenceSet.has("semantic");
+  const hasStatic = evidenceSet.has("static");
+
+  let stroke: string = graphColors.edgeRelationship;
+  if (hasStatic && hasSemantic) stroke = graphColors.edgeBlended;
+  else if (hasStatic) stroke = graphColors.edgeStatic;
+
+  const baseWidth = hasStatic && !hasSemantic
+    ? 1.2 + Math.max(0, Math.min(1, staticConfidence)) * 1.2
+    : hasStatic && hasSemantic
+      ? 2.1
+      : 1.5;
+
+  return {
+    ...edge,
+    style: {
+      ...(edge.style || {}),
+      stroke,
+      strokeWidth: Number(baseWidth.toFixed(2)),
+      strokeDasharray: ambiguous ? "5,4" : undefined,
+    },
+  };
+}
+
+function upsertStaticRelationshipEdge(
+  edges: Edge[],
+  pairToIndex: Map<string, number>,
+  source: string,
+  target: string,
+  staticKind: string,
+  weight: number,
+  confidence: number
+): boolean {
+  if (!source || !target || source === target) return false;
+  const pair = relationPairKey(source, target);
+  const safeWeight = Math.max(1, Math.round(weight || 1));
+  const safeConfidence = Math.max(0, Math.min(1, confidence || 0.5));
+
+  const existingIndex = pairToIndex.get(pair);
+  if (existingIndex != null) {
+    const current = edges[existingIndex];
+    const data = (current.data as EdgeData | undefined) || {};
+    const evidenceSet = edgeEvidence(data);
+    evidenceSet.add("static");
+
+    const existingKinds = (data.staticKind || "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter(Boolean);
+    const kindSet = new Set(existingKinds);
+    kindSet.add(staticKind);
+
+    const mergedData: EdgeData = {
+      ...data,
+      evidence: [...evidenceSet],
+      staticKind: [...kindSet].join(","),
+      staticConfidence: Math.max(
+        typeof data.staticConfidence === "number" ? data.staticConfidence : 0,
+        safeConfidence
+      ),
+      bundledCount: Math.max(
+        safeWeight,
+        typeof data.bundledCount === "number" ? data.bundledCount + safeWeight : safeWeight
+      ),
+    };
+
+    let next: Edge = {
+      ...current,
+      data: mergedData,
+    };
+
+    const labelParts = [...kindSet].sort((a, b) => a.localeCompare(b));
+    const totalWeight = typeof mergedData.bundledCount === "number"
+      ? mergedData.bundledCount
+      : safeWeight;
+    if (!current.label || String(current.label).trim().length === 0) {
+      next.label = totalWeight > 1 ? `${labelParts.join("+")} x${totalWeight}` : labelParts.join("+");
+    }
+
+    next = applyEdgeEvidenceStyle(next, evidenceSet, !!data.ambiguous, mergedData.staticConfidence || safeConfidence);
+    edges[existingIndex] = next;
+    return true;
+  }
+
+  const label = safeWeight > 1 ? `${staticKind} x${safeWeight}` : staticKind;
+  const evidenceSet = new Set<string>(["static"]);
+  const newEdge = applyEdgeEvidenceStyle(
+    {
+      id: `e-static-${pairToIndex.size + 1}`,
+      source,
+      target,
+      label,
+      animated: false,
+      data: {
+        layout: false,
+        kind: "relationship",
+        evidence: ["static"],
+        staticKind,
+        staticConfidence: safeConfidence,
+        bundledCount: safeWeight,
+      },
+    },
+    evidenceSet,
+    false,
+    safeConfidence
+  );
+
+  const nextIndex = edges.length;
+  edges.push(newEdge);
+  pairToIndex.set(pair, nextIndex);
+  return true;
+}
+
+function addStaticEdgesToVisibleNodes(
+  staticEdges: StaticEdge[],
+  nodePathMap: Map<string, Set<string>>,
+  edges: Edge[],
+  pairToIndex: Map<string, number>
+): number {
+  if (nodePathMap.size === 0 || staticEdges.length === 0) return 0;
+
+  const ranked = [...staticEdges].sort((a, b) => staticEdgeSortScore(b) - staticEdgeSortScore(a));
+  let added = 0;
+
+  for (const staticEdge of ranked) {
+    if (added >= MAX_STATIC_EDGE_INSERTIONS) break;
+
+    const src = nodePathMap.get(normalizeTargetPath(staticEdge.source_path));
+    const tgt = nodePathMap.get(normalizeTargetPath(staticEdge.target_path));
+    if (!src || !tgt) continue;
+
+    for (const sourceNodeId of src) {
+      if (added >= MAX_STATIC_EDGE_INSERTIONS) break;
+      for (const targetNodeId of tgt) {
+        if (added >= MAX_STATIC_EDGE_INSERTIONS) break;
+        if (sourceNodeId === targetNodeId) continue;
+        if (
+          upsertStaticRelationshipEdge(
+            edges,
+            pairToIndex,
+            sourceNodeId,
+            targetNodeId,
+            staticEdge.kind,
+            staticEdge.weight,
+            staticEdge.confidence
+          )
+        ) {
+          added += 1;
+        }
+      }
+    }
+  }
+
+  return added;
+}
+
+function addStaticEdgesToAggregatedGroups(
+  staticEdges: StaticEdge[],
+  nodes: Node[],
+  edges: Edge[],
+  pairToIndex: Map<string, number>
+): number {
+  if (staticEdges.length === 0 || nodes.length === 0) return 0;
+
+  const availableGroups = new Set(
+    nodes
+      .filter((node) => node.id.startsWith("group:"))
+      .map((node) => node.id)
+  );
+  if (availableGroups.size < 2) return 0;
+
+  const aggregates = new Map<
+    string,
+    {
+      source: string;
+      target: string;
+      weight: number;
+      confidence: number;
+      calls: number;
+      imports: number;
+    }
+  >();
+
+  for (const staticEdge of staticEdges) {
+    const srcGroup = `group:${classifyComponentGroup(staticEdge.source_path).id}`;
+    const tgtGroup = `group:${classifyComponentGroup(staticEdge.target_path).id}`;
+    if (srcGroup === tgtGroup) continue;
+    if (!availableGroups.has(srcGroup) || !availableGroups.has(tgtGroup)) continue;
+
+    const key = relationPairKey(srcGroup, tgtGroup);
+    const entry = aggregates.get(key) || {
+      source: srcGroup,
+      target: tgtGroup,
+      weight: 0,
+      confidence: 0,
+      calls: 0,
+      imports: 0,
+    };
+    entry.weight += Math.max(1, Math.round(staticEdge.weight || 1));
+    entry.confidence = Math.max(entry.confidence, staticEdge.confidence || 0);
+    if (staticEdge.kind === "calls") entry.calls += staticEdge.weight;
+    if (staticEdge.kind === "imports") entry.imports += staticEdge.weight;
+    aggregates.set(key, entry);
+  }
+
+  const ranked = [...aggregates.values()].sort((a, b) => {
+    const scoreA = a.weight * (0.5 + a.confidence);
+    const scoreB = b.weight * (0.5 + b.confidence);
+    return scoreB - scoreA;
+  });
+
+  let added = 0;
+  for (const entry of ranked) {
+    if (added >= MAX_STATIC_EDGE_INSERTIONS) break;
+    const kind =
+      entry.calls > 0 && entry.imports > 0
+        ? "calls+imports"
+        : entry.calls > 0
+          ? "calls"
+          : "imports";
+    if (
+      upsertStaticRelationshipEdge(
+        edges,
+        pairToIndex,
+        entry.source,
+        entry.target,
+        kind,
+        entry.weight,
+        entry.confidence
+      )
+    ) {
+      added += 1;
+    }
+  }
+
+  return added;
+}
+
+function addStaticRelationships(
+  data: GraphData,
+  nav: NavEntry,
+  nodes: Node[],
+  baseEdges: Edge[]
+): Edge[] {
+  const staticEdges = data.static_analysis?.edges || [];
+  if (staticEdges.length === 0 || nodes.length === 0) return baseEdges;
+
+  const edges = [...baseEdges];
+  const pairToIndex = buildRelationEdgePairIndex(edges);
+  const nodePathMap = buildPathNodeMap(nodes);
+  const pathAdded = addStaticEdgesToVisibleNodes(staticEdges, nodePathMap, edges, pairToIndex);
+
+  if (pathAdded > 0) {
+    return edges;
+  }
+
+  if (nav.level === "system") {
+    addStaticEdgesToAggregatedGroups(staticEdges, nodes, edges, pairToIndex);
+  }
+
+  return edges;
+}
+
+function applyConnectivityPolicy(
+  nodes: Node[],
+  edges: Edge[],
+  nav: NavEntry
+): Edge[] {
+  const relationIndices: number[] = [];
+  for (let i = 0; i < edges.length; i += 1) {
+    const data = edges[i].data as EdgeData | undefined;
+    if (data?.kind === "relationship") {
+      relationIndices.push(i);
+    }
+  }
+
+  if (relationIndices.length <= 2) return edges;
+
+  const nodeById = new Map<string, Node>();
+  for (const node of nodes) {
+    nodeById.set(node.id, node);
+  }
+
+  const hintByNodeId = new Map<string, string | null>();
+  const pathHintByNodeId = new Map<string, string | null>();
+  for (const node of nodes) {
+    hintByNodeId.set(node.id, plannerHintForNode(node));
+    pathHintByNodeId.set(node.id, pathHintForNode(node));
+  }
+
+  const degree = new Map<string, number>();
+  for (const index of relationIndices) {
+    const edge = edges[index];
+    const weight = relationLayoutWeight(edge);
+    degree.set(edge.source, (degree.get(edge.source) || 0) + weight);
+    degree.set(edge.target, (degree.get(edge.target) || 0) + weight);
+  }
+  let maxDegree = 1;
+  for (const value of degree.values()) {
+    if (value > maxDegree) maxDegree = value;
+  }
+
+  const candidates: RelationCandidate[] = [];
+  for (const index of relationIndices) {
+    const edge = edges[index];
+    if (!nodeById.has(edge.source) || !nodeById.has(edge.target)) continue;
+    const data = edge.data as EdgeData | undefined;
+    const weight = relationLayoutWeight(edge);
+    const reasons: string[] = [];
+    let score = weight * 1.35;
+    reasons.push(`weight:${weight}`);
+    const evidenceSet = edgeEvidence(data);
+    const hasStatic = evidenceSet.has("static");
+    const hasSemantic = evidenceSet.has("semantic");
+
+    if (hasStatic) {
+      score += 1.25;
+      reasons.push("static");
+    }
+    if (hasSemantic) {
+      score += 0.55;
+      reasons.push("semantic");
+    }
+    if (hasStatic && hasSemantic) {
+      score += 0.8;
+      reasons.push("blended");
+    }
+    if (typeof data?.staticConfidence === "number") {
+      score += Math.max(0, Math.min(1, data.staticConfidence)) * 1.1;
+      reasons.push(`confidence:${Number(data.staticConfidence).toFixed(2)}`);
+    }
+    if (typeof data?.staticKind === "string" && data.staticKind.length > 0) {
+      if (data.staticKind.includes("calls")) {
+        score += 0.28;
+        reasons.push("calls");
+      }
+      if (data.staticKind.includes("imports")) {
+        score += 0.16;
+        reasons.push("imports");
+      }
+    }
+
+    const sourceHint = hintByNodeId.get(edge.source);
+    const targetHint = hintByNodeId.get(edge.target);
+    if (sourceHint && targetHint && sourceHint === targetHint) {
+      score += 1.0;
+      reasons.push("same-hint");
+    }
+
+    const sourcePathHint = pathHintByNodeId.get(edge.source);
+    const targetPathHint = pathHintByNodeId.get(edge.target);
+    if (sourcePathHint && targetPathHint && sourcePathHint === targetPathHint) {
+      score += 0.6;
+      reasons.push("same-path");
+    }
+
+    const labelText = typeof edge.label === "string" ? edge.label.trim().toLowerCase() : "";
+    if (labelText.length > 0 && labelText !== "relates to") {
+      score += labelText.startsWith("x") ? 0.25 : 0.45;
+      reasons.push("labeled");
+    }
+
+    if (data?.ambiguous) {
+      score -= 0.5;
+      reasons.push("ambiguous");
+    }
+
+    const centrality =
+      ((degree.get(edge.source) || 0) + (degree.get(edge.target) || 0)) / (2 * maxDegree);
+    score += centrality * 0.9;
+    reasons.push(`centrality:${centrality.toFixed(2)}`);
+
+    candidates.push({
+      index,
+      source: edge.source,
+      target: edge.target,
+      score,
+      weight,
+      reasons,
+    });
+  }
+
+  if (candidates.length <= 2) return edges;
+
+  const ranked = [...candidates].sort((a, b) => {
+    if (b.score !== a.score) return b.score - a.score;
+    if (b.weight !== a.weight) return b.weight - a.weight;
+    const aKey = `${a.source}->${a.target}`;
+    const bKey = `${b.source}->${b.target}`;
+    return aKey.localeCompare(bKey);
+  });
+
+  const budget = relationVisibilityBudget(nav.level, nodes.length, ranked.length);
+  const selected = new Set<number>(ranked.slice(0, budget).map((c) => c.index));
+
+  const nodesWithRelations = new Set<string>();
+  for (const c of candidates) {
+    nodesWithRelations.add(c.source);
+    nodesWithRelations.add(c.target);
+  }
+
+  const coveredNodes = new Set<string>();
+  for (const c of candidates) {
+    if (!selected.has(c.index)) continue;
+    coveredNodes.add(c.source);
+    coveredNodes.add(c.target);
+  }
+
+  for (const nodeId of nodesWithRelations) {
+    if (coveredNodes.has(nodeId)) continue;
+    const fallback = ranked.find(
+      (candidate) =>
+        !selected.has(candidate.index) &&
+        (candidate.source === nodeId || candidate.target === nodeId)
+    );
+    if (!fallback) continue;
+    selected.add(fallback.index);
+    coveredNodes.add(fallback.source);
+    coveredNodes.add(fallback.target);
+  }
+
+  const maxSelected = budget + Math.ceil(nodesWithRelations.size * 0.2);
+  if (selected.size > maxSelected) {
+    const selectedIncident = new Map<string, number>();
+    for (const c of candidates) {
+      if (!selected.has(c.index)) continue;
+      selectedIncident.set(c.source, (selectedIncident.get(c.source) || 0) + 1);
+      selectedIncident.set(c.target, (selectedIncident.get(c.target) || 0) + 1);
+    }
+
+    const selectedByAscendingScore = ranked
+      .filter((candidate) => selected.has(candidate.index))
+      .sort((a, b) => a.score - b.score);
+
+    for (const candidate of selectedByAscendingScore) {
+      if (selected.size <= maxSelected) break;
+      const sourceCount = selectedIncident.get(candidate.source) || 0;
+      const targetCount = selectedIncident.get(candidate.target) || 0;
+      if (sourceCount <= 1 || targetCount <= 1) continue;
+      selected.delete(candidate.index);
+      selectedIncident.set(candidate.source, sourceCount - 1);
+      selectedIncident.set(candidate.target, targetCount - 1);
+    }
+  }
+
+  const hideSuppressed =
+    ranked.length > Math.max(26, Math.round(budget * 1.55)) && nav.level !== "file";
+  const maxScore = ranked[0]?.score || 1;
+  const byIndex = new Map<number, RelationCandidate>();
+  for (const candidate of candidates) {
+    byIndex.set(candidate.index, candidate);
+  }
+
+  return edges.map((edge, index) => {
+    const candidate = byIndex.get(index);
+    if (!candidate) return edge;
+
+    const data = edge.data as EdgeData | undefined;
+    const evidenceSet = edgeEvidence(data);
+    const hasStatic = evidenceSet.has("static");
+    const hasSemantic = evidenceSet.has("semantic");
+    const baseStroke = data?.ambiguous
+      ? graphColors.edgeAmbiguous
+      : hasStatic && hasSemantic
+        ? graphColors.edgeBlended
+        : hasStatic
+          ? graphColors.edgeStatic
+          : graphColors.edgeRelationship;
+    const normalizedScore =
+      maxScore > 0 ? Math.max(0, Math.min(1, candidate.score / maxScore)) : 0;
+    const selectedByPolicy = selected.has(index);
+
+    const nextData: EdgeData = {
+      ...(data || {}),
+      policyScore: Number(candidate.score.toFixed(2)),
+      policySelected: selectedByPolicy,
+      policySuppressed: !selectedByPolicy,
+      policyReason: candidate.reasons,
+    };
+
+    if (selectedByPolicy) {
+      return {
+        ...edge,
+        hidden: false,
+        animated: normalizedScore > 0.72,
+        style: {
+          ...(edge.style || {}),
+          stroke: baseStroke,
+          strokeWidth: Number((1.5 + normalizedScore * 1.7).toFixed(2)),
+          opacity: 0.95,
+        },
+        data: nextData,
+      };
+    }
+
+    return {
+      ...edge,
+      hidden: hideSuppressed ? true : edge.hidden,
+      selectable: hideSuppressed ? false : edge.selectable,
+      animated: false,
+      style: {
+        ...(edge.style || {}),
+        stroke: baseStroke,
+        strokeWidth: 1,
+        strokeDasharray: (edge.style && "strokeDasharray" in edge.style)
+          ? edge.style.strokeDasharray
+          : "4,4",
+        opacity: hideSuppressed ? 0 : 0.18,
+      },
+      labelStyle: {
+        ...(edge.labelStyle || {}),
+        opacity: hideSuppressed ? 0 : 0.24,
+      },
+      data: nextData,
+    };
+  });
 }
 
 export function transformGraph(
   data: GraphData,
   nav: NavEntry
 ): { nodes: Node[]; edges: Edge[] } {
-  console.log("[transform] nav:", nav.level, nav.id);
-  console.log("[transform] files count:", data.files.length);
-  console.log("[transform] file paths:", data.files.map((f) => f.path));
-  if (data.overview) {
-    console.log("[transform] component targets:", data.overview.components.map((c) => ({ name: c.name, target: c.target })));
-  }
   let result: { nodes: Node[]; edges: Edge[] };
 
   if (nav.level === "system") result = systemLevel(data, nav.id);
   else if (nav.level === "module") result = moduleLevel(data, nav.id!);
   else if (nav.level === "file") result = fileLevel(data, nav.id!);
   else result = { nodes: [], edges: [] };
+
+  if (result.nodes.length > 0) {
+    const withStatic = addStaticRelationships(data, nav, result.nodes, result.edges);
+    const withBackbone = addGeneratedLayoutBackbone(result.nodes, withStatic);
+    result = {
+      nodes: result.nodes,
+      edges: applyConnectivityPolicy(result.nodes, withBackbone, nav),
+    };
+  }
 
   if (result.nodes.length === 0) {
     result.nodes.push({
@@ -42,8 +1448,8 @@ export function transformGraph(
         name: "No data found",
         description:
           nav.level === "system"
-            ? "No .dive/ metadata found. Run an agent with the dive-tag skill to generate it."
-            : `No metadata found for "${nav.label}". The module may not have been tagged yet.`,
+            ? "No .dive/ metadata found."
+            : `No metadata found for "${nav.label}".`,
         target: null,
         hasChildren: false,
       },
@@ -61,81 +1467,130 @@ function systemLevel(
 ): { nodes: Node[]; edges: Edge[] } {
   const ov = data.overview;
 
-  // Filtered view: show only components in a specific subsystem group
   if (filterId && ov) {
     return filteredSystemLevel(data, ov, filterId);
   }
 
-  // If overview has many components, aggregate into subsystem groups
   if (ov && ov.components.length > CLUSTER_THRESHOLD) {
-    return aggregatedSystemLevel(data, ov);
+    return aggregatedSystemLevel(ov);
   }
 
-  // Otherwise show the flat component view
   return flatSystemLevel(data);
 }
 
-function aggregatedSystemLevel(
-  _data: GraphData,
-  ov: OverviewDoc
-): { nodes: Node[]; edges: Edge[] } {
+function aggregatedSystemLevel(ov: OverviewDoc): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
 
-  // Group components by first directory segment of their target
-  const groups = new Map<string, ComponentEntry[]>();
-  for (const raw of ov.components) {
-    const comp = { ...raw, target: cleanTarget(raw.target) };
-    const dir = comp.target ? comp.target.split("/")[0] : "other";
-    const list = groups.get(dir) || [];
-    list.push(comp);
-    groups.set(dir, list);
+  const components = prepareComponents(ov.components);
+
+  const groups = new Map<string, { label: string; comps: ComponentRecord[] }>();
+  for (const comp of components) {
+    const bucket = classifyComponentGroup(comp.target);
+    const existing = groups.get(bucket.id) || { label: bucket.label, comps: [] };
+    existing.comps.push(comp);
+    groups.set(bucket.id, existing);
   }
 
-  // Create group nodes
-  for (const [dir, comps] of groups) {
+  for (const [groupId, group] of groups) {
+    const { label, comps } = group;
     nodes.push({
-      id: `group:${dir}`,
+      id: `group:${groupId}`,
       type: "group",
       position: { x: 0, y: 0 },
       data: {
-        name: dir,
+        name: label,
         count: comps.length,
         children: comps.map((c) => c.name),
-        groupId: dir,
+        groupId,
+        folderHints: deriveFolderHints(comps, groupId),
       },
     });
   }
 
-  // Create edges between groups based on inter-group component relationships
-  const compToGroup = new Map<string, string>();
-  for (const [dir, comps] of groups) {
+  const nameToGroups = new Map<string, Set<string>>();
+  for (const [groupId, group] of groups) {
+    const { comps } = group;
     for (const comp of comps) {
-      compToGroup.set(comp.name.toLowerCase().replace(/[\s_-]+/g, ""), dir);
+      const set = nameToGroups.get(comp.normName) || new Set<string>();
+      set.add(`group:${groupId}`);
+      nameToGroups.set(comp.normName, set);
     }
   }
 
   const rels = parseRelationships(ov.relationships);
-  const seenEdges = new Set<string>();
+  const aggregated = new Map<
+    string,
+    {
+      source: string;
+      target: string;
+      count: number;
+      labels: Set<string>;
+      ambiguous: boolean;
+    }
+  >();
 
-  for (const r of rels) {
-    const srcNorm = r.src.toLowerCase().replace(/[\s_-]+/g, "");
-    const tgtNorm = r.tgt.toLowerCase().replace(/[\s_-]+/g, "");
-    const srcGroup = compToGroup.get(srcNorm);
-    const tgtGroup = compToGroup.get(tgtNorm);
+  for (const rel of rels) {
+    const srcGroups = [...(nameToGroups.get(normalizeName(rel.src)) || [])];
+    const tgtGroups = [...(nameToGroups.get(normalizeName(rel.tgt)) || [])];
 
-    if (srcGroup && tgtGroup && srcGroup !== tgtGroup) {
-      const edgeKey = `${srcGroup}->${tgtGroup}`;
-      if (!seenEdges.has(edgeKey)) {
-        seenEdges.add(edgeKey);
-        edges.push({
-          id: `e-grp-${srcGroup}-${tgtGroup}`,
-          source: `group:${srcGroup}`,
-          target: `group:${tgtGroup}`,
-          animated: true,
-        });
+    if (srcGroups.length === 0 || tgtGroups.length === 0) continue;
+
+    const ambiguous = srcGroups.length > 1 || tgtGroups.length > 1;
+    for (const src of srcGroups) {
+      for (const tgt of tgtGroups) {
+        if (src === tgt) continue;
+        const key = `${src}->${tgt}`;
+        const entry = aggregated.get(key) || {
+          source: src,
+          target: tgt,
+          count: 0,
+          labels: new Set<string>(),
+          ambiguous: false,
+        };
+
+        entry.count += 1;
+        if (rel.label) {
+          entry.labels.add(rel.label);
+        }
+        entry.ambiguous = entry.ambiguous || ambiguous;
+        aggregated.set(key, entry);
       }
     }
+  }
+
+  let index = 0;
+  for (const entry of aggregated.values()) {
+    const labels = [...entry.labels].filter((label) => label.trim().length > 0);
+
+    let label = "";
+    if (entry.count > 1) {
+      label = `x${entry.count}`;
+    }
+    if (labels.length === 1) {
+      label = label ? `${label} ${labels[0]}` : labels[0];
+    } else if (labels.length > 1) {
+      const suffix = `${labels.length} rel types`;
+      label = label ? `${label} (${suffix})` : suffix;
+    }
+
+    edges.push({
+      id: `e-grp-bundle-${index}`,
+      source: entry.source,
+      target: entry.target,
+      label: label || undefined,
+      animated: true,
+      style: entry.ambiguous
+        ? { stroke: graphColors.edgeAmbiguous, strokeWidth: 1.5, strokeDasharray: "5,4" }
+        : { stroke: graphColors.edgeRelationship, strokeWidth: 1.5 },
+      data: {
+        layout: false,
+        kind: "relationship",
+        bundledCount: entry.count,
+        ambiguous: entry.ambiguous,
+      },
+    });
+    index += 1;
   }
 
   return { nodes, edges };
@@ -146,51 +1601,72 @@ function filteredSystemLevel(
   ov: OverviewDoc,
   groupId: string
 ): { nodes: Node[]; edges: Edge[] } {
-  const cleaned = ov.components.map((c) => ({ ...c, target: cleanTarget(c.target) }));
-  const filtered = cleaned.filter((c) => {
-    if (!c.target) return groupId === "other";
-    return c.target.startsWith(groupId);
-  });
+  const components = prepareComponents(ov.components).filter((c) => matchesGroup(c, groupId));
+  const label = groupLabelFromId(groupId);
 
-  return buildComponentNodes(data, ov, filtered);
+  return buildComponentNodes(data, ov, components, {
+    parentSummary: {
+      groupId,
+      label,
+      totalComponents: components.length,
+      componentNames: components.map((c) => c.name),
+      folderHints: deriveFolderHints(components, groupId),
+    },
+    fileGroupsAreLeaf: true,
+  });
 }
 
-/**
- * Shared builder for component-level views (both filtered and flat).
- *
- * 1. Detects directory containment: if a component targets a directory
- *    that contains other components' target files, it becomes a "group"
- *    node and its children are excluded from this level (click to drill in).
- * 2. Groups components that share the same target file into "filegroup" nodes.
- * 3. Everything else becomes a normal "component" node.
- */
 function buildComponentNodes(
   data: GraphData,
   ov: OverviewDoc,
-  components: ComponentEntry[]
+  components: ComponentRecord[],
+  options: BuildOptions = {}
 ): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
+  const duplicateNames = duplicateNameSet(components);
 
-  // Deduplicate first
-  const all = deduplicateComponents(components);
-
-  // Step 1: Detect directory containment
-  const containers = detectContainers(all);
-  const childNames = new Set<string>();
-  for (const { children } of containers) {
-    for (const c of children) childNames.add(c.name.toLowerCase());
+  let summaryNodeId: string | null = null;
+  if (options.parentSummary) {
+    summaryNodeId = `summary-group:${options.parentSummary.groupId}`;
+    nodes.push({
+      id: summaryNodeId,
+      type: "group",
+      position: { x: 0, y: 0 },
+      data: {
+        name: options.parentSummary.label,
+        count: options.parentSummary.totalComponents,
+        children: options.parentSummary.componentNames,
+        groupId: options.parentSummary.groupId,
+        folderHints: options.parentSummary.folderHints,
+        isSummary: true,
+        nonNavigable: true,
+      },
+    });
   }
 
-  // Step 2: Map component names → node IDs (for edge routing)
-  const compToNodeId = new Map<string, string>();
+  const connectSummary = (nodeId: string) => {
+    if (!summaryNodeId) return;
+    addStructuralEdge(edges, summaryNodeId, nodeId);
+  };
 
-  // Build container group nodes
+  const containers = detectContainers(components);
+  const childKeys = new Set<string>();
+  const containerParentKeys = new Set<string>();
+  for (const { parent, children } of containers) {
+    containerParentKeys.add(parent.key);
+    for (const child of children) {
+      childKeys.add(child.key);
+    }
+  }
+
+  const compToNodeIds = new Map<string, Set<string>>();
+
   for (const { parent, children } of containers) {
     const dirPath = parent.target!.endsWith("/")
       ? parent.target!
-      : parent.target! + "/";
-    const nodeId = `group:${dirPath}`;
+      : `${parent.target!}/`;
+    const nodeId = `group:${parent.key}`;
 
     nodes.push({
       id: nodeId,
@@ -201,43 +1677,38 @@ function buildComponentNodes(
         count: children.length,
         children: children.map((c) => c.name),
         groupId: dirPath,
+        folderHints: deriveFolderHints([parent, ...children], dirPath),
+        hasNameCollision: duplicateNames.has(parent.normName),
       },
     });
 
-    compToNodeId.set(
-      parent.name.toLowerCase().replace(/[\s_-]+/g, ""),
-      nodeId
-    );
-    for (const c of children) {
-      compToNodeId.set(
-        c.name.toLowerCase().replace(/[\s_-]+/g, ""),
-        nodeId
-      );
+    connectSummary(nodeId);
+
+    addNameNodeMapping(compToNodeIds, parent.normName, nodeId);
+    for (const child of children) {
+      addNameNodeMapping(compToNodeIds, child.normName, nodeId);
     }
   }
 
-  // Step 3: Build nodes for remaining components (not children of containers)
-  const remaining = all.filter(
-    (c) => !childNames.has(c.name.toLowerCase()) &&
-      !containers.some((ct) => ct.parent.name === c.name)
+  const remaining = components.filter(
+    (comp) => !childKeys.has(comp.key) && !containerParentKeys.has(comp.key)
   );
 
-  // Group remaining by target file
-  const byTarget = new Map<string, ComponentEntry[]>();
+  const byTarget = new Map<string, { target: string | null; comps: ComponentRecord[] }>();
   for (const comp of remaining) {
-    const key = comp.target || `unnamed:${comp.name}`;
-    const list = byTarget.get(key) || [];
-    list.push(comp);
-    byTarget.set(key, list);
+    const key = comp.target ? `target:${comp.target}` : `orphan:${comp.key}`;
+    const existing = byTarget.get(key) || { target: comp.target, comps: [] };
+    existing.comps.push(comp);
+    byTarget.set(key, existing);
   }
 
-  for (const [target, comps] of byTarget) {
+  for (const { target, comps } of byTarget.values()) {
     if (comps.length === 1) {
       const comp = comps[0];
       const resolvedModule = findModule(data, comp.name);
       const matchingFiles = findComponentFiles(data, comp.name, comp.target);
 
-      const nodeId = `comp:${comp.name}`;
+      const nodeId = `comp:${comp.key}`;
       nodes.push({
         id: nodeId,
         type: "component",
@@ -248,78 +1719,78 @@ function buildComponentNodes(
           target: comp.target,
           moduleId: resolvedModule?.name || null,
           hasChildren: !!(resolvedModule || matchingFiles.length > 0),
+          hasNameCollision: duplicateNames.has(comp.normName),
         },
       });
 
-      compToNodeId.set(
-        comp.name.toLowerCase().replace(/[\s_-]+/g, ""),
-        nodeId
-      );
-    } else {
-      const fileDoc = data.files.find((f) => f.path === target);
-      const mod = findModuleByTarget(data, target);
+      connectSummary(nodeId);
+      addNameNodeMapping(compToNodeIds, comp.normName, nodeId);
+      continue;
+    }
 
-      console.log(`[filegroup] target="${target}" fileDoc found=${!!fileDoc}`);
-      if (fileDoc) {
-        console.log(`[filegroup] tags=${fileDoc.tags.length} dive_file="${fileDoc.dive_file}" dive_rel=${fileDoc.dive_rel.length}`);
-      } else {
-        console.log(`[filegroup] NO MATCH. Available paths:`, data.files.map((f) => f.path).filter((p) => p.includes(target.split("/").pop() || "")));
-      }
+    const fileDoc = target
+      ? data.files.find((f) => f.path === target || f.path.endsWith(target))
+      : undefined;
+    const mod = target ? findModuleByTarget(data, target) : undefined;
 
-      const nodeId = `filegroup:${target}`;
-      nodes.push({
-        id: nodeId,
-        type: "filegroup",
-        position: { x: 0, y: 0 },
-        data: {
-          path: target,
-          absPath:
-            fileDoc?.abs_path || data.project_root + "/" + target,
-          concepts: comps.map((c) => ({
-            name: c.name,
-            description: c.description,
-          })),
-          diveFile: fileDoc?.dive_file || "",
-          diveRels: fileDoc?.dive_rel || [],
-          tags: (fileDoc?.tags || []).map((t: any) => ({
-            line: t.line,
-            description: t.description,
-          })),
-          tagCount: fileDoc?.tags.length || 0,
-          moduleId: mod?.name || null,
-        },
-      });
+    const nodeId = `filegroup:${target || comps[0].key}`;
+    nodes.push({
+      id: nodeId,
+      type: "filegroup",
+      position: { x: 0, y: 0 },
+      data: {
+        path: target || comps[0].name,
+        absPath: fileDoc?.abs_path || (target ? `${data.project_root}/${target}` : data.project_root),
+        concepts: comps.map((c) => ({
+          name: c.name,
+          description: c.description,
+        })),
+        diveFile: fileDoc?.dive_file || "",
+        diveRels: fileDoc?.dive_rel || [],
+        tags: (fileDoc?.tags || []).map((t) => ({
+          line: t.line,
+          description: t.description,
+        })),
+        tagCount: fileDoc?.tags.length || 0,
+        moduleId: mod?.name || null,
+        collapsedCount: comps.length,
+        collapsedNames: comps.map((c) => c.name),
+        parentGroupId: options.parentSummary?.label || null,
+        parentTotalComponents: options.parentSummary?.totalComponents || null,
+        isLeaf: !!options.fileGroupsAreLeaf,
+        hasNameCollision: comps.some((c) => duplicateNames.has(c.normName)),
+      },
+    });
 
-      for (const comp of comps) {
-        compToNodeId.set(
-          comp.name.toLowerCase().replace(/[\s_-]+/g, ""),
-          nodeId
-        );
-      }
+    connectSummary(nodeId);
+
+    for (const comp of comps) {
+      addNameNodeMapping(compToNodeIds, comp.normName, nodeId);
     }
   }
 
-  // Step 4: Build edges, routing through compToNodeId
   const rels = parseRelationships(ov.relationships);
-  const seenEdges = new Set<string>();
+  const seenRelEdges = new Set<string>();
 
-  for (const r of rels) {
-    const srcNorm = r.src.toLowerCase().replace(/[\s_-]+/g, "");
-    const tgtNorm = r.tgt.toLowerCase().replace(/[\s_-]+/g, "");
-    const srcId = compToNodeId.get(srcNorm);
-    const tgtId = compToNodeId.get(tgtNorm);
+  for (const rel of rels) {
+    const srcIds = [...(compToNodeIds.get(normalizeName(rel.src)) || [])];
+    const tgtIds = [...(compToNodeIds.get(normalizeName(rel.tgt)) || [])];
 
-    if (srcId && tgtId && srcId !== tgtId) {
-      const edgeKey = `${srcId}->${tgtId}`;
-      if (!seenEdges.has(edgeKey)) {
-        seenEdges.add(edgeKey);
-        edges.push({
-          id: `e-sys-${edges.length}`,
-          source: srcId,
-          target: tgtId,
-          label: r.label,
-          animated: true,
-        });
+    if (srcIds.length === 0 || tgtIds.length === 0) continue;
+
+    const ambiguous = srcIds.length > 1 || tgtIds.length > 1;
+    for (const srcId of srcIds) {
+      for (const tgtId of tgtIds) {
+        if (srcId === tgtId) continue;
+        addRelationshipEdge(
+          edges,
+          seenRelEdges,
+          srcId,
+          tgtId,
+          rel.label,
+          rel.raw,
+          ambiguous
+        );
       }
     }
   }
@@ -327,36 +1798,29 @@ function buildComponentNodes(
   return { nodes, edges };
 }
 
-/**
- * Detect components whose target is a directory that contains other
- * components' target files. Returns parent-children groupings.
- */
 function detectContainers(
-  components: ComponentEntry[]
-): { parent: ComponentEntry; children: ComponentEntry[] }[] {
-  const result: { parent: ComponentEntry; children: ComponentEntry[] }[] = [];
-  const claimed = new Set<string>(); // child names already claimed
+  components: ComponentRecord[]
+): { parent: ComponentRecord; children: ComponentRecord[] }[] {
+  const result: { parent: ComponentRecord; children: ComponentRecord[] }[] = [];
+  const claimed = new Set<string>();
 
-  // Sort so shorter target paths are checked first (broader directories first)
   const sorted = [...components].sort(
     (a, b) => (a.target?.length || 0) - (b.target?.length || 0)
   );
 
   for (const potential of sorted) {
     if (!potential.target) continue;
-    if (claimed.has(potential.name)) continue;
-
-    // Only consider directory-like targets
+    if (claimed.has(potential.key)) continue;
     if (!isLikelyDirectory(potential.target)) continue;
 
     const dirPath = potential.target.endsWith("/")
       ? potential.target
-      : potential.target + "/";
+      : `${potential.target}/`;
 
-    const children: ComponentEntry[] = [];
+    const children: ComponentRecord[] = [];
     for (const other of components) {
-      if (other === potential) continue;
-      if (claimed.has(other.name)) continue;
+      if (other.key === potential.key) continue;
+      if (claimed.has(other.key)) continue;
       if (!other.target) continue;
       if (other.target.startsWith(dirPath)) {
         children.push(other);
@@ -365,7 +1829,9 @@ function detectContainers(
 
     if (children.length > 0) {
       result.push({ parent: potential, children });
-      for (const c of children) claimed.add(c.name);
+      for (const child of children) {
+        claimed.add(child.key);
+      }
     }
   }
 
@@ -378,22 +1844,11 @@ function isLikelyDirectory(path: string): boolean {
   return !lastSegment.includes(".");
 }
 
-function deduplicateComponents(comps: ComponentEntry[]): ComponentEntry[] {
-  const seen = new Set<string>();
-  return comps.filter((c) => {
-    const key = c.name.toLowerCase();
-    if (seen.has(key)) return false;
-    seen.add(key);
-    return true;
-  });
-}
-
 function flatSystemLevel(data: GraphData): { nodes: Node[]; edges: Edge[] } {
   const ov = data.overview;
 
   if (ov && ov.components.length > 0) {
-    const cleaned = ov.components.map((c) => ({ ...c, target: cleanTarget(c.target) }));
-    return buildComponentNodes(data, ov, cleaned);
+    return buildComponentNodes(data, ov, prepareComponents(ov.components));
   }
 
   const nodes: Node[] = [];
@@ -434,18 +1889,8 @@ function flatSystemLevel(data: GraphData): { nodes: Node[]; edges: Edge[] } {
         });
       }
     } else {
-      for (const f of data.files) {
-        nodes.push({
-          id: `file:${f.path}`,
-          type: "file",
-          position: { x: 0, y: 0 },
-          data: {
-            path: f.path,
-            absPath: f.abs_path,
-            description: f.dive_file || `${f.tags.length} tags`,
-            tagCount: f.tags.length,
-          },
-        });
+      for (const file of data.files) {
+        addFileNode(nodes, file);
       }
       addDiveRelEdges(data, nodes, edges);
     }
@@ -464,58 +1909,52 @@ function moduleLevel(
   const edges: Edge[] = [];
 
   const mod = findModule(data, moduleId);
-
   if (mod) {
     buildModuleNodes(data, mod, nodes, edges);
     return { nodes, edges };
   }
 
   const dirFiles = data.files.filter(
-    (f) =>
-      f.path.startsWith(moduleId + "/") || f.path.startsWith(moduleId)
+    (file) => file.path.startsWith(`${moduleId}/`) || file.path.startsWith(moduleId)
   );
 
   if (dirFiles.length > 0) {
-    for (const f of dirFiles) {
-      addFileNode(nodes, f);
+    for (const file of dirFiles) {
+      addFileNode(nodes, file);
     }
     addDiveRelEdges(data, nodes, edges);
     return { nodes, edges };
   }
 
-  // Strategy 3: Use component target from overview
   const rawComp = data.overview?.components.find(
-    (c) => c.name.toLowerCase() === moduleId.toLowerCase()
+    (comp) => comp.name.toLowerCase() === moduleId.toLowerCase()
   );
   const comp = rawComp ? { ...rawComp, target: cleanTarget(rawComp.target) } : undefined;
+
   if (comp) {
     const files = findComponentFiles(data, comp.name, comp.target);
     if (files.length > 0) {
-      for (const f of files) {
-        addFileNode(nodes, f);
+      for (const file of files) {
+        addFileNode(nodes, file);
       }
       addDiveRelEdges(data, nodes, edges);
       return { nodes, edges };
     }
 
-    // Strategy 3b: Find module whose file list overlaps with target path
     if (comp.target) {
-      const mod = findModuleByTarget(data, comp.target);
-      if (mod) {
-        buildModuleNodes(data, mod, nodes, edges);
+      const targetModule = findModuleByTarget(data, comp.target);
+      if (targetModule) {
+        buildModuleNodes(data, targetModule, nodes, edges);
         return { nodes, edges };
       }
-    }
 
-    // Strategy 3c: Create a node for the target itself (untagged file)
-    if (comp.target) {
       nodes.push({
         id: `file:${comp.target}`,
         type: "file",
         position: { x: 0, y: 0 },
         data: {
           path: comp.target,
-          absPath: data.project_root + "/" + comp.target,
+          absPath: `${data.project_root}/${comp.target}`,
           description: comp.description || "No dive tags in this file yet",
           tagCount: 0,
         },
@@ -524,12 +1963,11 @@ function moduleLevel(
     }
   }
 
-  // Strategy 4: Fuzzy file path matching
-  const lower = moduleId.toLowerCase().replace(/[\s_-]+/g, "");
-  for (const f of data.files) {
-    const pathNorm = f.path.toLowerCase().replace(/[\s_-]+/g, "");
+  const lower = normalizeName(moduleId);
+  for (const file of data.files) {
+    const pathNorm = normalizeName(file.path);
     if (pathNorm.includes(lower)) {
-      addFileNode(nodes, f);
+      addFileNode(nodes, file);
     }
   }
   addDiveRelEdges(data, nodes, edges);
@@ -547,7 +1985,7 @@ function buildModuleNodes(
 
   for (const fileRef of mod.files) {
     const fileDoc = data.files.find(
-      (f) => f.path === fileRef.path || f.path.endsWith(fileRef.path)
+      (file) => file.path === fileRef.path || file.path.endsWith(fileRef.path)
     );
     const id = `file:${fileRef.path}`;
     if (seen.has(id)) continue;
@@ -559,19 +1997,19 @@ function buildModuleNodes(
       position: { x: 0, y: 0 },
       data: {
         path: fileRef.path,
-        absPath: fileDoc?.abs_path || (data.project_root + "/" + fileRef.path),
+        absPath: fileDoc?.abs_path || `${data.project_root}/${fileRef.path}`,
         description: fileRef.description || fileDoc?.dive_file || "",
         tagCount: fileDoc?.tags.length || 0,
       },
     });
   }
 
-  const modLower = mod.name.toLowerCase().replace(/[\s_-]+/g, "");
-  for (const f of data.files) {
-    const id = `file:${f.path}`;
+  const modLower = normalizeName(mod.name);
+  for (const file of data.files) {
+    const id = `file:${file.path}`;
     if (seen.has(id)) continue;
 
-    const pathNorm = f.path.toLowerCase().replace(/[\s_-]+/g, "");
+    const pathNorm = normalizeName(file.path);
     if (pathNorm.includes(modLower)) {
       seen.add(id);
       nodes.push({
@@ -579,28 +2017,36 @@ function buildModuleNodes(
         type: "file",
         position: { x: 0, y: 0 },
         data: {
-          path: f.path,
-          absPath: f.abs_path,
-          description: f.dive_file || `${f.tags.length} tags`,
-          tagCount: f.tags.length,
+          path: file.path,
+          absPath: file.abs_path,
+          description: file.dive_file || `${file.tags.length} tags`,
+          tagCount: file.tags.length,
         },
       });
     }
   }
 
   const rels = parseRelationships(mod.relationships);
-  for (let i = 0; i < rels.length; i++) {
-    const r = rels[i];
-    const srcNode = findNodeByPath(nodes, r.src);
-    const tgtNode = findNodeByPath(nodes, r.tgt);
-    if (srcNode && tgtNode) {
-      edges.push({
-        id: `e-mod-${i}`,
-        source: srcNode.id,
-        target: tgtNode.id,
-        label: r.label,
-        animated: true,
-      });
+  const seenRelEdges = new Set<string>();
+  for (const rel of rels) {
+    const srcNodes = findNodesByRef(nodes, rel.src);
+    const tgtNodes = findNodesByRef(nodes, rel.tgt);
+    if (srcNodes.length === 0 || tgtNodes.length === 0) continue;
+
+    const ambiguous = srcNodes.length > 1 || tgtNodes.length > 1;
+    for (const srcNode of srcNodes) {
+      for (const tgtNode of tgtNodes) {
+        if (srcNode.id === tgtNode.id) continue;
+        addRelationshipEdge(
+          edges,
+          seenRelEdges,
+          srcNode.id,
+          tgtNode.id,
+          rel.label,
+          rel.raw,
+          ambiguous
+        );
+      }
     }
   }
 
@@ -617,11 +2063,10 @@ function fileLevel(
   const edges: Edge[] = [];
 
   const file = data.files.find(
-    (f) => f.path === filePath || f.path.endsWith(filePath)
+    (entry) => entry.path === filePath || entry.path.endsWith(filePath)
   );
   if (!file) return { nodes, edges };
 
-  // Add parent summary node with overview concepts targeting this file
   const concepts = findConceptsForFile(data, file.path);
   if (concepts.length > 0) {
     const summaryId = `summary:${file.path}`;
@@ -641,11 +2086,7 @@ function fileLevel(
       },
     });
 
-    edges.push({
-      id: `e-summary-file`,
-      source: summaryId,
-      target: `file:${file.path}`,
-    });
+    addStructuralEdge(edges, summaryId, `file:${file.path}`);
   }
 
   nodes.push({
@@ -675,19 +2116,16 @@ function fileLevel(
       },
     });
 
-    edges.push({
-      id: `e-tag-${tag.line}`,
-      source: `file:${file.path}`,
-      target: tagId,
-    });
+    addStructuralEdge(edges, `file:${file.path}`, tagId);
   }
 
-  for (let i = 0; i < file.dive_rel.length; i++) {
+  const seenRelEdges = new Set<string>();
+  for (let i = 0; i < file.dive_rel.length; i += 1) {
     const rel = file.dive_rel[i];
     const refPath = extractFileRef(rel, data);
     if (!refPath) continue;
 
-    const refFile = data.files.find((f) => f.path === refPath);
+    const refFile = data.files.find((entry) => entry.path === refPath);
     const refId = `ref:${refPath}:${i}`;
 
     nodes.push({
@@ -704,14 +2142,7 @@ function fileLevel(
     });
 
     const label = extractRelLabel(rel, refPath);
-    edges.push({
-      id: `e-rel-${i}`,
-      source: `file:${file.path}`,
-      target: refId,
-      label,
-      animated: true,
-      style: { stroke: "#f59e0b", strokeWidth: 1.5, strokeDasharray: "5,5" },
-    });
+    addRelationshipEdge(edges, seenRelEdges, `file:${file.path}`, refId, label, rel, false);
   }
 
   return { nodes, edges };
@@ -736,19 +2167,21 @@ function findConceptsForFile(
 }
 
 function findModuleByTarget(data: GraphData, target: string): ModuleDoc | undefined {
-  const t = target.replace(/^\.\//, "");
+  const normalizedTarget = target.replace(/^\.\//, "");
   for (const mod of data.modules) {
-    for (const f of mod.files) {
-      const fp = f.path.replace(/^\.\//, "");
-      // Exact file match
-      if (fp === t) return mod;
-      // Module file is under the target directory
-      if (fp.startsWith(t + "/") || fp.startsWith(t)) return mod;
-      // Target file is in the same directory tree as a module file
-      const targetDir = t.includes("/")
-        ? t.substring(0, t.lastIndexOf("/"))
-        : t;
-      if (targetDir && fp.startsWith(targetDir + "/")) return mod;
+    for (const file of mod.files) {
+      const normalizedPath = file.path.replace(/^\.\//, "");
+      if (normalizedPath === normalizedTarget) return mod;
+      if (
+        normalizedPath.startsWith(`${normalizedTarget}/`) ||
+        normalizedPath.startsWith(normalizedTarget)
+      ) {
+        return mod;
+      }
+      const targetDir = normalizedTarget.includes("/")
+        ? normalizedTarget.substring(0, normalizedTarget.lastIndexOf("/"))
+        : normalizedTarget;
+      if (targetDir && normalizedPath.startsWith(`${targetDir}/`)) return mod;
     }
   }
   return undefined;
@@ -763,10 +2196,8 @@ function findModule(data: GraphData, id: string): ModuleDoc | undefined {
   mod = data.modules.find((m) => m.name.toLowerCase() === lower);
   if (mod) return mod;
 
-  const norm = lower.replace(/[\s_-]+/g, "");
-  mod = data.modules.find(
-    (m) => m.name.toLowerCase().replace(/[\s_-]+/g, "") === norm
-  );
+  const norm = normalizeName(lower);
+  mod = data.modules.find((m) => normalizeName(m.name) === norm);
   if (mod) return mod;
 
   mod = data.modules.find((m) => m.title.toLowerCase() === lower);
@@ -790,75 +2221,87 @@ function findComponentFiles(
   const seen = new Set<string>();
 
   if (target) {
-    const t = target.replace(/^\.\//, "");
-    for (const f of data.files) {
+    const normalizedTarget = target.replace(/^\.\//, "");
+    for (const file of data.files) {
       if (
-        f.path.startsWith(t + "/") ||
-        f.path === t ||
-        f.path.startsWith(t)
+        file.path.startsWith(`${normalizedTarget}/`) ||
+        file.path === normalizedTarget ||
+        file.path.startsWith(normalizedTarget)
       ) {
-        if (!seen.has(f.path)) {
-          files.push(f);
-          seen.add(f.path);
+        if (!seen.has(file.path)) {
+          files.push(file);
+          seen.add(file.path);
         }
       }
     }
   }
 
-  const lower = componentName.toLowerCase().replace(/[\s_-]+/g, "");
-  for (const f of data.files) {
-    if (seen.has(f.path)) continue;
-    const pathNorm = f.path.toLowerCase().replace(/[\s_-]+/g, "");
+  const lower = normalizeName(componentName);
+  for (const file of data.files) {
+    if (seen.has(file.path)) continue;
+    const pathNorm = normalizeName(file.path);
     if (pathNorm.includes(lower)) {
-      files.push(f);
-      seen.add(f.path);
+      files.push(file);
+      seen.add(file.path);
     }
   }
 
   return files;
 }
 
+function findNodesByRef(nodes: Node[], value: string): Node[] {
+  const token = unwrapEntityToken(value);
+  const lower = token.toLowerCase();
+  const norm = normalizeName(token);
 
-function findNodeByPath(nodes: Node[], name: string): Node | undefined {
-  const lower = name.toLowerCase();
-  return nodes.find((n) => {
-    const path: string = (n.data as any).path || "";
+  return nodes.filter((node) => {
+    const data = node.data as {
+      path?: string;
+      target?: string;
+      name?: string;
+    };
+    const path = data.path || data.target || data.name || "";
+    if (!path) return false;
+
     const fileName = path.split("/").pop() || "";
     const fileBase = fileName.replace(/\.\w+$/, "");
+
     return (
-      path === name ||
+      path === token ||
       path.toLowerCase().includes(lower) ||
       fileName.toLowerCase() === lower ||
-      fileBase.toLowerCase() === lower
+      fileBase.toLowerCase() === lower ||
+      normalizeName(path) === norm
     );
   });
 }
 
-function addFileNode(nodes: Node[], f: FileDiveDoc) {
-  const id = `file:${f.path}`;
-  if (nodes.some((n) => n.id === id)) return;
+function addFileNode(nodes: Node[], file: FileDiveDoc) {
+  const id = `file:${file.path}`;
+  if (nodes.some((node) => node.id === id)) return;
   nodes.push({
     id,
     type: "file",
     position: { x: 0, y: 0 },
     data: {
-      path: f.path,
-      absPath: f.abs_path,
-      description: f.dive_file || `${f.tags.length} tags`,
-      tagCount: f.tags.length,
+      path: file.path,
+      absPath: file.abs_path,
+      description: file.dive_file || `${file.tags.length} tags`,
+      tagCount: file.tags.length,
     },
   });
 }
 
 function addDiveRelEdges(data: GraphData, nodes: Node[], edges: Edge[]) {
-  const nodeIds = new Set(nodes.map((n) => n.id));
-  const edgeIds = new Set(edges.map((e) => e.id));
+  const nodeIds = new Set(nodes.map((node) => node.id));
+  const seenRelEdges = new Set<string>();
 
   for (const node of [...nodes]) {
-    const filePath: string = (node.data as any).path;
+    const nodeData = node.data as { path?: string };
+    const filePath = nodeData.path;
     if (!filePath) continue;
 
-    const fileDoc = data.files.find((f) => f.path === filePath);
+    const fileDoc = data.files.find((file) => file.path === filePath);
     if (!fileDoc) continue;
 
     for (const rel of fileDoc.dive_rel) {
@@ -869,33 +2312,29 @@ function addDiveRelEdges(data: GraphData, nodes: Node[], edges: Edge[]) {
       if (!nodeIds.has(targetId)) continue;
       if (targetId === node.id) continue;
 
-      const edgeId = `e-drel-${node.id}-${targetId}`;
-      if (edgeIds.has(edgeId)) continue;
-      edgeIds.add(edgeId);
-
       const label = extractRelLabel(rel, refPath);
-
-      edges.push({
-        id: edgeId,
-        source: node.id,
-        target: targetId,
+      addRelationshipEdge(
+        edges,
+        seenRelEdges,
+        node.id,
+        targetId,
         label,
-        animated: true,
-        style: { stroke: "#f59e0b", strokeWidth: 1.5 },
-      });
+        rel,
+        false
+      );
     }
   }
 }
 
 function extractFileRef(relText: string, data: GraphData): string | null {
-  for (const f of data.files) {
-    if (relText.includes(f.path)) return f.path;
+  for (const file of data.files) {
+    if (relText.includes(file.path)) return file.path;
   }
 
   const pathMatch = relText.match(/\b((?:[\w.-]+\/)+[\w.-]+\.\w+)\b/);
   if (pathMatch) {
     const found = data.files.find(
-      (f) => f.path === pathMatch[1] || f.path.endsWith(pathMatch[1])
+      (file) => file.path === pathMatch[1] || file.path.endsWith(pathMatch[1])
     );
     return found?.path || null;
   }
@@ -904,8 +2343,8 @@ function extractFileRef(relText: string, data: GraphData): string | null {
 }
 
 function extractRelLabel(rel: string, refPath: string): string {
-  let label = rel.replace(refPath, "").trim();
-  label = label.replace(/^[-–:→←><\s]+|[-–:→←><\s]+$/g, "").trim();
+  const removedPath = rel.replace(refPath, "").trim();
+  const label = removedPath.replace(/^[-–:→←><\s]+|[-–:→←><\s]+$/g, "").trim();
   return label || "relates to";
 }
 
@@ -913,34 +2352,78 @@ function groupFilesByDirectory(
   files: FileDiveDoc[]
 ): Map<string, FileDiveDoc[]> {
   const groups = new Map<string, FileDiveDoc[]>();
-  for (const f of files) {
-    const parts = f.path.split("/");
+  for (const file of files) {
+    const parts = file.path.split("/");
     const dir = parts.length > 1 ? parts[0] : ".";
     const list = groups.get(dir) || [];
-    list.push(f);
+    list.push(file);
     groups.set(dir, list);
   }
   return groups;
 }
 
-interface ParsedRel {
-  src: string;
-  tgt: string;
-  label: string;
+function splitArrow(rel: string):
+  | { left: string; right: string; reverse: boolean }
+  | null {
+  const arrows = [
+    { token: "->", reverse: false },
+    { token: "→", reverse: false },
+    { token: "<-", reverse: true },
+    { token: "←", reverse: true },
+  ] as const;
+
+  let bestIndex = -1;
+  let best: (typeof arrows)[number] | null = null;
+
+  for (const arrow of arrows) {
+    const idx = rel.indexOf(arrow.token);
+    if (idx === -1) continue;
+    if (bestIndex === -1 || idx < bestIndex) {
+      bestIndex = idx;
+      best = arrow;
+    }
+  }
+
+  if (!best) return null;
+
+  const left = rel.slice(0, bestIndex).trim();
+  const right = rel.slice(bestIndex + best.token.length).trim();
+  if (!left || !right) return null;
+
+  return { left, right, reverse: best.reverse };
+}
+
+function splitTargetAndLabel(text: string): { target: string; label: string } {
+  const colonIdx = text.indexOf(":");
+  if (colonIdx === -1) {
+    return { target: text.trim(), label: "" };
+  }
+
+  const target = text.slice(0, colonIdx).trim();
+  const label = text.slice(colonIdx + 1).trim();
+  return { target, label };
 }
 
 function parseRelationships(rels: string[]): ParsedRel[] {
   const out: ParsedRel[] = [];
   for (const rel of rels) {
-    let m = rel.match(/^(.+?)\s*(?:->|→)\s*(.+?):\s*(.*)$/);
-    if (m) {
-      out.push({ src: m[1].trim(), tgt: m[2].trim(), label: m[3].trim() });
-      continue;
-    }
-    m = rel.match(/^(.+?)\s*(?:<-|←)\s*(.+?):\s*(.*)$/);
-    if (m) {
-      out.push({ src: m[2].trim(), tgt: m[1].trim(), label: m[3].trim() });
-    }
+    const arrow = splitArrow(rel);
+    if (!arrow) continue;
+
+    const parsedRight = splitTargetAndLabel(arrow.right);
+    const srcRaw = arrow.reverse ? parsedRight.target : arrow.left;
+    const tgtRaw = arrow.reverse ? arrow.left : parsedRight.target;
+
+    const src = unwrapEntityToken(srcRaw);
+    const tgt = unwrapEntityToken(tgtRaw);
+    if (!src || !tgt) continue;
+
+    out.push({
+      src,
+      tgt,
+      label: parsedRight.label,
+      raw: rel,
+    });
   }
   return out;
 }

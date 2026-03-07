@@ -1,11 +1,26 @@
-import type { GraphData } from "./types";
+import type { GraphData, MarkdownDoc } from "./types";
 
 const API_BASE = "/api";
+const GRAPH_FETCH_TIMEOUT_MS = 15000;
 
 export async function fetchGraph(): Promise<GraphData> {
-  const r = await fetch(`${API_BASE}/graph`);
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), GRAPH_FETCH_TIMEOUT_MS);
+
+  const r = await fetch(`${API_BASE}/graph`, { signal: controller.signal }).finally(() => {
+    window.clearTimeout(timeout);
+  });
   if (!r.ok) throw new Error(`Graph fetch failed: ${r.status}`);
   return r.json();
+}
+
+export async function fetchMarkdown(path: string): Promise<MarkdownDoc> {
+  const query = new URLSearchParams({ path }).toString();
+  const response = await fetch(`${API_BASE}/markdown?${query}`);
+  if (!response.ok) {
+    throw new Error(`Markdown fetch failed: ${response.status}`);
+  }
+  return response.json();
 }
 
 export function subscribeToUpdates(onUpdate: () => void): () => void {

@@ -6,6 +6,8 @@ export interface GraphData {
   overview: OverviewDoc | null;
   modules: ModuleDoc[];
   files: FileDiveDoc[];
+  static_analysis: StaticAnalysis;
+  diagnostics: ParseDiagnostic[];
 }
 
 export interface OverviewDoc {
@@ -45,14 +47,64 @@ export interface FileDiveDoc {
   tags: DiveTag[];
 }
 
+export interface StaticAnalysis {
+  files_analyzed: number;
+  file_facts: StaticFileFacts[];
+  edges: StaticEdge[];
+  truncated: boolean;
+}
+
+export interface StaticFileFacts {
+  path: string;
+  language: string;
+  symbol_count: number;
+  import_count: number;
+  call_count: number;
+}
+
+export interface StaticEdge {
+  source_path: string;
+  target_path: string;
+  kind: string;
+  weight: number;
+  confidence: number;
+}
+
 export interface DiveTag {
   line: number;
   description: string;
 }
 
+export type ParseDiagnosticScope =
+  | "overview.components"
+  | "overview.relationships"
+  | "module.files"
+  | "module.relationships";
+
+export type ParseDiagnosticCode =
+  | "unparsed_component_line"
+  | "unparsed_relationship_line"
+  | "unparsed_module_file_line"
+  | "duplicate_component_name";
+
+export interface ParseDiagnostic {
+  path: string;
+  scope: ParseDiagnosticScope;
+  line: number | null;
+  code: ParseDiagnosticCode;
+  message: string;
+  raw: string;
+  related: string[];
+}
+
+export interface MarkdownDoc {
+  path: string;
+  content: string;
+}
+
 // Navigation
 
-export type NavLevel = "system" | "module" | "file";
+export type NavLevel = "system" | "module" | "file" | "doc";
 
 export interface NavEntry {
   level: NavLevel;

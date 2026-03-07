@@ -1,25 +1,29 @@
-import { useMemo, useCallback, useEffect } from "react";
+import { useMemo, useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
 import {
   ReactFlow,
   Background,
   Controls,
   MiniMap,
+  ViewportPortal,
   useNodesState,
   useEdgesState,
+  type Edge,
   type Node,
   type NodeMouseHandler,
+  type ReactFlowInstance,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
 import type { GraphData, NavEntry } from "../types";
 import { transformGraph } from "./transform";
-import { layoutGraph } from "./layout";
+import { estimateLayoutNodeSize, layoutGraph } from "./layout";
 import { ComponentNode } from "./ComponentNode";
 import { FileNode } from "./FileNode";
 import { TagNode } from "./TagNode";
 import { GroupNode } from "./GroupNode";
 import { FileGroupNode } from "./FileGroupNode";
 import { openInVscode } from "../api";
+import { graphColors, minimapNodeColor } from "./colors";
 
 const nodeTypes = {
   component: ComponentNode,
@@ -35,50 +39,511 @@ interface Props {
   onNavigate: (entry: NavEntry) => void;
 }
 
+interface EdgeData {
+  kind?: "structure" | "relationship";
+  layout?: boolean;
+  evidence?: string[];
+  staticKind?: string;
+  policyScore?: number;
+  policySelected?: boolean;
+  policySuppressed?: boolean;
+}
+
+interface GraphNodeData {
+  name?: string;
+  groupId?: string;
+  isSummary?: boolean;
+  nonNavigable?: boolean;
+  absPath?: string;
+  isLeaf?: boolean;
+  tagCount?: number;
+  path?: string;
+  hasChildren?: boolean;
+  moduleId?: string | null;
+  dirPath?: string | null;
+  isHeader?: boolean;
+  isReference?: boolean;
+  line?: number;
+  target?: string | null;
+  relIn?: number;
+  relOut?: number;
+  relTotal?: number;
+  relRole?: "entry" | "sink" | "hub" | "isolated" | "flow";
+}
+
+interface FolderZone {
+  key: string;
+  label: string;
+  count: number;
+  depth: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+function normalizePath(value: string): string {
+  return value
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^\/+/, "")
+    .replace(/\/+/g, "/");
+}
+
+function folderPathForNode(node: Node): string | null {
+  if (node.type === "tag") return null;
+
+  const data = node.data as GraphNodeData;
+  if (data.isSummary || data.nonNavigable) return null;
+
+  let raw = "";
+  if (typeof data.path === "string" && data.path.trim()) {
+    raw = data.path;
+  } else if (typeof data.target === "string" && data.target.trim()) {
+    raw = data.target;
+  } else if (typeof data.groupId === "string" && data.groupId.startsWith("path:")) {
+    raw = data.groupId.slice(5);
+  }
+
+  if (!raw) return null;
+  const normalized = normalizePath(raw);
+  if (!normalized) return null;
+
+  const segments = normalized.split("/").filter(Boolean);
+  if (segments.length === 0) return null;
+
+  const last = segments[segments.length - 1] || "";
+  if (last.includes(".")) {
+    segments.pop();
+  }
+
+  if (segments.length === 0) return null;
+  return segments.join("/");
+}
+
+function buildFolderZones(nodes: Node[]): FolderZone[] {
+  const membersByPrefix = new Map<string, Set<string>>();
+  const nodeById = new Map<string, Node>();
+
+  for (const node of nodes) {
+    nodeById.set(node.id, node);
+    const folderPath = folderPathForNode(node);
+    if (!folderPath) continue;
+
+    const segments = folderPath.split("/").filter(Boolean);
+    if (segments.length === 0) continue;
+
+    const maxDepth = Math.min(3, segments.length);
+    for (let depth = 1; depth <= maxDepth; depth += 1) {
+      const prefix = segments.slice(0, depth).join("/");
+      const set = membersByPrefix.get(prefix) || new Set<string>();
+      set.add(node.id);
+      membersByPrefix.set(prefix, set);
+    }
+  }
+
+  const countByPrefix = new Map<string, number>();
+  for (const [prefix, set] of membersByPrefix) {
+    countByPrefix.set(prefix, set.size);
+  }
+
+  const includedPrefixes = [...membersByPrefix.keys()].filter((prefix) => {
+    const count = countByPrefix.get(prefix) || 0;
+    if (count < 2) return false;
+
+    const depth = prefix.split("/").length;
+    if (depth <= 1) return true;
+
+    const parent = prefix.split("/").slice(0, -1).join("/");
+    const parentCount = countByPrefix.get(parent) || 0;
+
+    // If a child zone would contain exactly the same nodes as parent, it adds
+    // visual clutter without separating space.
+    if (parentCount > 0 && parentCount === count) return false;
+
+    return true;
+  });
+
+  const zones: FolderZone[] = [];
+  for (const prefix of includedPrefixes) {
+    const memberIds = membersByPrefix.get(prefix);
+    if (!memberIds || memberIds.size < 2) continue;
+    const depth = prefix.split("/").length;
+
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+
+    for (const nodeId of memberIds) {
+      const node = nodeById.get(nodeId);
+      if (!node) continue;
+      const size = estimateLayoutNodeSize(node);
+      const x1 = node.position.x;
+      const y1 = node.position.y;
+      const x2 = x1 + size.width;
+      const y2 = y1 + size.height;
+      minX = Math.min(minX, x1);
+      minY = Math.min(minY, y1);
+      maxX = Math.max(maxX, x2);
+      maxY = Math.max(maxY, y2);
+    }
+
+    const padX = depth === 1 ? 48 : 32;
+    const padTop = depth === 1 ? 42 : 32;
+    const padBottom = depth === 1 ? 26 : 20;
+
+    zones.push({
+      key: `zone:${prefix}`,
+      label: prefix,
+      count: memberIds.size,
+      depth,
+      x: minX - padX,
+      y: minY - padTop,
+      width: maxX - minX + padX * 2,
+      height: maxY - minY + padTop + padBottom,
+    });
+  }
+
+  return zones
+    .sort((a, b) => {
+      if (a.depth !== b.depth) return a.depth - b.depth;
+      if (b.count !== a.count) return b.count - a.count;
+      return a.label.localeCompare(b.label);
+    })
+    .slice(0, 28);
+}
+
+function isMarkdownPath(path: string | null | undefined): boolean {
+  if (!path) return false;
+  const normalized = path.toLowerCase();
+  return normalized.endsWith(".md") || normalized.endsWith(".markdown");
+}
+
+function markdownNavEntry(node: Node, data: GraphNodeData): NavEntry | null {
+  if (node.type === "component" && !data.hasChildren && isMarkdownPath(data.target)) {
+    const filePath = data.target!;
+    const fileName = filePath.split("/").pop() || filePath;
+    return { level: "doc", label: fileName, id: filePath };
+  }
+
+  if ((node.type === "file" || node.type === "filegroup") && data.path && isMarkdownPath(data.path)) {
+    const fileName = data.path.split("/").pop() || data.path;
+    return { level: "doc", label: fileName, id: data.path };
+  }
+
+  return null;
+}
+
+function applyRelationFocus(
+  baseNodes: Node[],
+  baseEdges: Edge[],
+  enabled: boolean,
+  focusedNodeId: string | null
+): { nodes: Node[]; edges: Edge[] } {
+  if (!enabled || !focusedNodeId) {
+    return { nodes: baseNodes, edges: baseEdges };
+  }
+
+  const activeNeighbors = new Set<string>([focusedNodeId]);
+  const activeEdgeIds = new Set<string>();
+
+  for (const edge of baseEdges) {
+    const data = edge.data as EdgeData | undefined;
+    if (data?.kind !== "relationship") continue;
+    if (edge.source === focusedNodeId || edge.target === focusedNodeId) {
+      activeEdgeIds.add(edge.id);
+      activeNeighbors.add(edge.source);
+      activeNeighbors.add(edge.target);
+    }
+  }
+
+  const nodes = baseNodes.map((node) => {
+    const active = activeNeighbors.has(node.id);
+    return {
+      ...node,
+      style: {
+        ...(node.style || {}),
+        opacity: active ? 1 : 0.2,
+        filter: active ? "none" : "saturate(0.45)",
+      },
+    };
+  });
+
+  const edges = baseEdges.map((edge) => {
+    const active = activeEdgeIds.has(edge.id);
+    const data = edge.data as EdgeData | undefined;
+    const edgeStyle = edge.style || {};
+    const stroke = edgeStyle.stroke || graphColors.edgeStructure;
+    const strokeWidth = typeof edgeStyle.strokeWidth === "number" ? edgeStyle.strokeWidth : 1.5;
+    const evidence = Array.isArray(data?.evidence) ? data.evidence : [];
+    const hasStatic = evidence.includes("static");
+    const hasSemantic = evidence.includes("semantic");
+
+    const activeStroke =
+      data?.kind === "relationship"
+        ? hasStatic && hasSemantic
+          ? graphColors.edgeFocusBlended
+          : hasStatic
+            ? graphColors.edgeFocusStatic
+            : graphColors.edgeFocusRelationship
+        : graphColors.edgeFocusStructure;
+
+    return {
+      ...edge,
+      animated: active ? true : false,
+      style: {
+        ...edgeStyle,
+        stroke: active ? activeStroke : stroke,
+        strokeWidth: active ? Math.max(strokeWidth, 2.5) : strokeWidth,
+        opacity: active ? 1 : 0.1,
+      },
+      labelStyle: {
+        ...(edge.labelStyle || {}),
+        opacity: active ? 1 : 0.1,
+      },
+      zIndex: active ? 20 : 1,
+    };
+  });
+
+  return { nodes, edges };
+}
+
+function enrichNodesWithRelationMetrics(baseNodes: Node[], baseEdges: Edge[]): Node[] {
+  const relationEdges = baseEdges.filter(
+    (edge) => (edge.data as EdgeData | undefined)?.kind === "relationship"
+  );
+
+  const relIn = new Map<string, number>();
+  const relOut = new Map<string, number>();
+
+  for (const edge of relationEdges) {
+    relOut.set(edge.source, (relOut.get(edge.source) || 0) + 1);
+    relIn.set(edge.target, (relIn.get(edge.target) || 0) + 1);
+  }
+
+  let maxTotal = 0;
+  for (const node of baseNodes) {
+    const total = (relIn.get(node.id) || 0) + (relOut.get(node.id) || 0);
+    if (total > maxTotal) maxTotal = total;
+  }
+
+  const hubThreshold = Math.max(4, Math.ceil(maxTotal * 0.6));
+
+  return baseNodes.map((node) => {
+    const incoming = relIn.get(node.id) || 0;
+    const outgoing = relOut.get(node.id) || 0;
+    const total = incoming + outgoing;
+
+    let relRole: GraphNodeData["relRole"] = "flow";
+    if (total === 0) relRole = "isolated";
+    else if (incoming === 0 && outgoing > 0) relRole = "entry";
+    else if (outgoing === 0 && incoming > 0) relRole = "sink";
+    else if (total >= hubThreshold) relRole = "hub";
+
+    return {
+      ...node,
+      data: {
+        ...(node.data as Record<string, unknown>),
+        relIn: incoming,
+        relOut: outgoing,
+        relTotal: total,
+        relRole,
+      },
+    };
+  });
+}
+
 export function GraphView({ data, nav, onNavigate }: Props) {
+  const [relationFocusOverride, setRelationFocusOverride] = useState<boolean | null>(null);
+  const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
+  const [folderZonesEnabled, setFolderZonesEnabled] = useState(true);
+  const flowRef = useRef<ReactFlowInstance<Node, Edge> | null>(null);
+  const pendingFitScopeRef = useRef<string | null>(null);
+
+  const navScopeKey = `${nav.level}:${nav.id || ""}`;
+  const defaultRelationFocus = nav.level === "system";
+  const relationFocusEnabled = relationFocusOverride ?? defaultRelationFocus;
+
   const { layoutNodes, layoutEdges } = useMemo(() => {
-    const { nodes, edges } = transformGraph(data, nav);
-    const positioned = layoutGraph(nodes, edges);
-    return { layoutNodes: positioned, layoutEdges: edges };
+    try {
+      const { nodes, edges } = transformGraph(data, nav);
+      const relationCount = edges.filter(
+        (edge) => (edge.data as EdgeData | undefined)?.kind === "relationship"
+      ).length;
+      const structuralCount = edges.filter(
+        (edge) => (edge.data as EdgeData | undefined)?.layout !== false
+      ).length;
+      const layoutDirection =
+        nav.level === "system" || relationCount > structuralCount ? "LR" : "TB";
+      const positioned = layoutGraph(nodes, edges, layoutDirection);
+      return { layoutNodes: positioned, layoutEdges: edges };
+    } catch (err) {
+      console.error("[graph] layout failed; using fallback positioning", err);
+      const { nodes, edges } = transformGraph(data, nav);
+      const fallback = nodes.map((node, idx) => ({
+        ...node,
+        position: {
+          x: (idx % 3) * 420,
+          y: Math.floor(idx / 3) * 260,
+        },
+      }));
+      return { layoutNodes: fallback, layoutEdges: edges };
+    }
   }, [data, nav]);
+
+  const enrichedLayoutNodes = useMemo(
+    () => enrichNodesWithRelationMetrics(layoutNodes, layoutEdges),
+    [layoutNodes, layoutEdges]
+  );
+
+  const relationPolicyStats = useMemo(() => {
+    let total = 0;
+    let selected = 0;
+    let suppressed = 0;
+    let hidden = 0;
+    for (const edge of layoutEdges) {
+      const data = edge.data as EdgeData | undefined;
+      if (data?.kind !== "relationship") continue;
+      total += 1;
+      if (data.policySelected) selected += 1;
+      if (data.policySuppressed) suppressed += 1;
+      if (edge.hidden) hidden += 1;
+    }
+    return { total, selected, suppressed, hidden };
+  }, [layoutEdges]);
+
+  const staticSummary = useMemo(
+    () => ({
+      files: data.static_analysis?.files_analyzed || 0,
+      edges: data.static_analysis?.edges?.length || 0,
+      truncated: !!data.static_analysis?.truncated,
+    }),
+    [data.static_analysis]
+  );
+
+  const folderZones = useMemo(() => {
+    if (!folderZonesEnabled) return [];
+    if (nav.level === "file") return [];
+    return buildFolderZones(enrichedLayoutNodes);
+  }, [enrichedLayoutNodes, nav.level, folderZonesEnabled]);
+
+  const { nodes: displayNodes, edges: displayEdges } = useMemo(
+    () =>
+      applyRelationFocus(
+        enrichedLayoutNodes,
+        layoutEdges,
+        relationFocusEnabled,
+        focusedNodeId
+      ),
+    [enrichedLayoutNodes, layoutEdges, relationFocusEnabled, focusedNodeId]
+  );
 
   const [nodes, setNodes, onNodesChange] = useNodesState(layoutNodes);
   const [edges, setEdges, onEdgesChange] = useEdgesState(layoutEdges);
 
   useEffect(() => {
-    setNodes(layoutNodes);
-    setEdges(layoutEdges);
-  }, [layoutNodes, layoutEdges, setNodes, setEdges]);
+    pendingFitScopeRef.current = navScopeKey;
+    const timer = window.setTimeout(() => {
+      setRelationFocusOverride(null);
+      setFocusedNodeId(null);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [navScopeKey]);
+
+  useEffect(() => {
+    setNodes(displayNodes);
+    setEdges(displayEdges);
+    if (pendingFitScopeRef.current === navScopeKey && flowRef.current && displayNodes.length > 0) {
+      const raf = window.requestAnimationFrame(() => {
+        flowRef.current?.fitView({ padding: 0.24, duration: 260 });
+        pendingFitScopeRef.current = null;
+      });
+      return () => window.cancelAnimationFrame(raf);
+    }
+  }, [displayNodes, displayEdges, navScopeKey, setNodes, setEdges]);
+
+  const onFlowInit = useCallback(
+    (instance: ReactFlowInstance<Node, Edge>) => {
+      flowRef.current = instance;
+      if (pendingFitScopeRef.current === navScopeKey) {
+        window.requestAnimationFrame(() => {
+          instance.fitView({ padding: 0.24, duration: 260 });
+          pendingFitScopeRef.current = null;
+        });
+      }
+    },
+    [navScopeKey]
+  );
+
+  const onPaneClick = useCallback(() => {
+    if (relationFocusEnabled) {
+      setFocusedNodeId(null);
+    }
+  }, [relationFocusEnabled]);
+
+  const onMiniMapClick = useCallback(
+    (event: MouseEvent<Element>, position: { x: number; y: number }) => {
+      event.stopPropagation();
+      const instance = flowRef.current;
+      if (!instance) return;
+
+      void instance.setCenter(position.x, position.y, {
+        zoom: instance.getZoom(),
+        duration: 220,
+      });
+    },
+    []
+  );
 
   const onNodeClick: NodeMouseHandler = useCallback(
-    (_event, node: Node) => {
-      const d = node.data as any;
+    (event, node: Node) => {
+      const d = node.data as GraphNodeData;
+      const wantsNavigate = event.metaKey || event.ctrlKey || event.shiftKey;
+      const markdownNav = markdownNavEntry(node, d);
+
+      if (markdownNav) {
+        onNavigate(markdownNav);
+        return;
+      }
+
+      if (relationFocusEnabled && !wantsNavigate) {
+        setFocusedNodeId((current) => (current === node.id ? null : node.id));
+        return;
+      }
 
       if (node.type === "group") {
+        if (d.nonNavigable || d.isSummary) return;
         // Subsystem group: drill into filtered system view
-        onNavigate({ level: "system", label: d.name, id: d.groupId });
+        onNavigate({ level: "system", label: d.name || "Group", id: d.groupId });
       } else if (node.type === "filegroup") {
         if (d.isSummary) {
           // Summary node in file view: open in VS Code
           if (d.absPath) openInVscode(d.absPath, 1);
-        } else if (d.tagCount > 0) {
+        } else if (d.isLeaf) {
+          if (d.absPath) openInVscode(d.absPath, 1);
+        } else if ((d.tagCount || 0) > 0 && d.path) {
           const fileName = d.path.split("/").pop() || d.path;
           onNavigate({ level: "file", label: fileName, id: d.path });
         } else if (d.absPath) {
           openInVscode(d.absPath, 1);
         }
       } else if (node.type === "component") {
-        if (!d.hasChildren) return;
+        if (!d.hasChildren) {
+          return;
+        }
         const id = d.moduleId || d.dirPath || d.name;
-        const label = d.name;
+        const label = d.name || "Component";
+        if (!id) return;
         onNavigate({ level: "module", label, id });
       } else if (node.type === "file") {
-        if (d.isHeader) {
+        if (d.isHeader && d.absPath) {
           openInVscode(d.absPath, 1);
-        } else if (d.isReference) {
+        } else if (d.isReference && d.path) {
           const fileName = d.path.split("/").pop() || d.path;
           onNavigate({ level: "file", label: fileName, id: d.path });
-        } else if (d.tagCount > 0) {
+        } else if ((d.tagCount || 0) > 0 && d.path) {
           // Has tags: drill into file level to see them
           const fileName = d.path.split("/").pop() || d.path;
           onNavigate({ level: "file", label: fileName, id: d.path });
@@ -87,20 +552,99 @@ export function GraphView({ data, nav, onNavigate }: Props) {
           openInVscode(d.absPath, 1);
         }
       } else if (node.type === "tag") {
-        openInVscode(d.absPath, d.line);
+        if (d.absPath && d.line) {
+          openInVscode(d.absPath, d.line);
+        }
       }
     },
-    [onNavigate]
+    [onNavigate, relationFocusEnabled]
   );
 
   return (
     <div style={{ width: "100%", height: "100%" }}>
+      <div className="graph-toolbar">
+        <button
+          type="button"
+          className={`graph-toolbar-button ${folderZonesEnabled ? "is-active" : ""}`}
+          onClick={() => setFolderZonesEnabled((value) => !value)}
+        >
+          {folderZonesEnabled ? "Folder Zones: ON" : "Folder Zones: OFF"}
+        </button>
+        <button
+          type="button"
+          className={`graph-toolbar-button ${relationFocusEnabled ? "is-active" : ""}`}
+          onClick={() => {
+            const next = !relationFocusEnabled;
+            setRelationFocusOverride(next);
+            if (!next) setFocusedNodeId(null);
+          }}
+        >
+          {relationFocusEnabled ? "Relation Focus: ON" : "Relation Focus: OFF"}
+        </button>
+        {relationPolicyStats.total > 0 && (
+          <span className="graph-toolbar-hint">
+            policy: showing {relationPolicyStats.selected}/{relationPolicyStats.total} relations
+            {relationPolicyStats.hidden > 0
+              ? `, hidden ${relationPolicyStats.hidden}`
+              : relationPolicyStats.suppressed > 0
+                ? `, de-emphasized ${relationPolicyStats.suppressed}`
+                : ""}
+          </span>
+        )}
+        {staticSummary.files > 0 && (
+          <span className="graph-toolbar-hint">
+            static: {staticSummary.files} files, {staticSummary.edges} inferred edges
+            {staticSummary.truncated ? " (truncated)" : ""}
+          </span>
+        )}
+        {relationFocusEnabled && (
+          <span className="graph-toolbar-hint">
+            click node to isolate 1-hop relations, click canvas to clear, hold cmd/ctrl to navigate
+          </span>
+        )}
+      </div>
+      <div className="graph-legend" aria-label="Graph color legend">
+        <span className="graph-legend-item">
+          <span className="graph-legend-dot is-component" />
+          component
+        </span>
+        <span className="graph-legend-item">
+          <span className="graph-legend-dot is-file" />
+          file
+        </span>
+        <span className="graph-legend-item">
+          <span className="graph-legend-dot is-group" />
+          group
+        </span>
+        <span className="graph-legend-item">
+          <span className="graph-legend-dot is-tag" />
+          tag
+        </span>
+        <span className="graph-legend-item">
+          <span className="graph-legend-line is-relationship" />
+          semantic rel
+        </span>
+        <span className="graph-legend-item">
+          <span className="graph-legend-line is-static" />
+          static rel
+        </span>
+        <span className="graph-legend-item">
+          <span className="graph-legend-line is-blended" />
+          blended rel
+        </span>
+        <span className="graph-legend-item">
+          <span className="graph-legend-dot is-warning" />
+          ambiguity/warning
+        </span>
+      </div>
       <ReactFlow
         nodes={nodes}
         edges={edges}
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onNodeClick={onNodeClick}
+        onPaneClick={onPaneClick}
+        onInit={onFlowInit}
         nodeTypes={nodeTypes}
         fitView
         fitViewOptions={{ padding: 0.2 }}
@@ -108,21 +652,37 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         maxZoom={2}
         defaultEdgeOptions={{
           type: "smoothstep",
-          style: { stroke: "#4a5568", strokeWidth: 1.5 },
+          style: { stroke: graphColors.edgeStructure, strokeWidth: 1.5 },
         }}
       >
-        <Background color="#2a3a5c" gap={20} />
+        {folderZones.length > 0 && (
+          <ViewportPortal>
+            <div className="folder-zones-layer">
+              {folderZones.map((zone) => (
+                <div
+                  key={zone.key}
+                  className={`folder-zone folder-zone-depth-${Math.min(zone.depth, 3)}`}
+                  style={{
+                    width: `${zone.width}px`,
+                    height: `${zone.height}px`,
+                    transform: `translate(${zone.x}px, ${zone.y}px)`,
+                  }}
+                >
+                  <div className="folder-zone-label">
+                    {zone.label}/ <span>{zone.count}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </ViewportPortal>
+        )}
+        <Background color={graphColors.grid} gap={20} />
         <Controls />
         <MiniMap
-          nodeColor={(n) => {
-            if (n.type === "group") return "#8b5cf6";
-            if (n.type === "filegroup") return "#6366f1";
-            if (n.type === "component") return "#0f9b8e";
-            if (n.type === "file") return "#3b82f6";
-            if (n.type === "tag") return "#f59e0b";
-            return "#666";
-          }}
-          style={{ background: "#1a1a2e" }}
+          nodeColor={(n) => minimapNodeColor(n.type)}
+          onClick={onMiniMapClick}
+          pannable
+          style={{ background: graphColors.minimapBackground }}
         />
       </ReactFlow>
     </div>

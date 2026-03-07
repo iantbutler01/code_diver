@@ -1,5 +1,6 @@
 import { Handle, Position } from "@xyflow/react";
 import type { NodeProps } from "@xyflow/react";
+import { CopyButton } from "./CopyButton";
 
 interface FileData {
   path: string;
@@ -14,6 +15,15 @@ interface FileData {
 export function FileNode({ data }: NodeProps) {
   const d = data as unknown as FileData;
   const fileName = d.path.split("/").pop() || d.path;
+  const copyText = [
+    `File: ${fileName}`,
+    `Path: ${d.path}`,
+    d.description ? `Description: ${d.description}` : null,
+    ...(d.diveRels || []).map((rel) => `Relation: ${rel}`),
+    `Tag count: ${d.tagCount}`,
+  ]
+    .filter(Boolean)
+    .join("\n");
 
   const className = [
     "node",
@@ -26,7 +36,10 @@ export function FileNode({ data }: NodeProps) {
   return (
     <div className={className}>
       <Handle type="target" position={Position.Top} />
-      <div className="node-title">{fileName}</div>
+      <div className="node-header">
+        <div className="node-title">{fileName}</div>
+        <CopyButton text={copyText} />
+      </div>
       <div className="node-path">{d.path}</div>
       {d.description && <div className="node-desc">{d.description}</div>}
       {d.diveRels && d.diveRels.length > 0 && (
