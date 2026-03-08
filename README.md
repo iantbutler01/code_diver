@@ -1,114 +1,69 @@
 # Code Diver
 
-Code Diver is a local system-mapping tool for code handoff and review.
-It combines `.dive` semantic metadata with static code signals, renders an explorable graph UI, and exposes the same read-only context through MCP.
+Code Diver is a local system-mapping tool for handoff and review. It combines `.dive` semantic metadata with static code signals, renders an explorable graph UI, and exposes the same read-only context through MCP.
 
 https://github.com/user-attachments/assets/4f45a9e3-6665-4909-a4ce-a684846be460
 
 ## Prerequisites
 
-- Rust (`stable`)
-- Node.js (for `web/` build)
-- If using `asdf`, load shell init before running commands:
+Rust (`stable`) and Node.js.
+
+## Quick Start
+
+Run from the root of the project you want to analyze:
 
 ```bash
-source ~/.zshrc
-```
-
-## Build and Run
-
-Install and build frontend:
-
-```bash
-source ~/.zshrc
-ASDF_NODEJS_VERSION=24.13.1 npm --prefix web install
-ASDF_NODEJS_VERSION=24.13.1 npm --prefix web run build
-```
-
-Start server:
-
-```bash
-source ~/.zshrc
+npm --prefix web install
+npm --prefix web run build
 cargo run -- --port 4000 --mcp-addr 127.0.0.1:4100
 ```
 
-Optional project path (default is current directory):
+To analyze a different project path:
 
 ```bash
 cargo run -- /path/to/project --port 4000 --mcp-addr 127.0.0.1:4100
 ```
 
-Project root scope:
-- Start `code_diver` from the root of the project being analyzed, or pass that root as `PROJECT_PATH`.
-- Graph discovery is scoped to that root. Launching from a subdirectory will exclude metadata and source files outside that subtree.
-- Metadata discovery expects `.dive/overview.md` and `.dive/modules/*.md` under the selected root.
+Graph discovery is scoped to the selected root. If you launch from a subdirectory, files and metadata outside that subtree are excluded. Metadata discovery expects `.dive/overview.md` and `.dive/modules/*.md` under the chosen root.
 
 ## Endpoints
 
-- UI: `http://127.0.0.1:4000/`
-- Graph JSON: `http://127.0.0.1:4000/api/graph`
-- Live updates (SSE): `http://127.0.0.1:4000/api/events`
-- Markdown render source: `http://127.0.0.1:4000/api/markdown?path=<project-relative.md>`
-- MCP: `http://127.0.0.1:4100/mcp` (or your `--mcp-addr`)
+UI: `http://127.0.0.1:4000/`  
+Graph JSON: `http://127.0.0.1:4000/api/graph`  
+Live updates (SSE): `http://127.0.0.1:4000/api/events`  
+Markdown source: `http://127.0.0.1:4000/api/markdown?path=<project-relative.md>`  
+MCP: `http://127.0.0.1:4100/mcp` (or your `--mcp-addr`)
 
 ## Current Implementation
 
-- `.dive` parser for overview/modules/file tags, with diagnostics for unparsed lines and duplicate component names.
-- Tree-sitter-backed static extraction for Rust, TypeScript, JavaScript, Python, and Go.
-- Static relation inference from import and call evidence with weight/confidence scoring.
-- Graph transformation pipeline that blends semantic and static relations for rendering policy.
-- Read-only MCP surface for overview, group drilldown, module/file context, relationship trace, markdown, and parser diagnostics.
+Code Diver currently ships a permissive `.dive` parser (with diagnostics), tree-sitter-backed static extraction (Rust, TypeScript, JavaScript, Python, Go), inferred static edges from imports/calls, a graph transform that blends semantic + static relations, and a read-only MCP surface for overview/group/module/file/trace/markdown/diagnostics.
 
 ## Dive Format (Consumed by Code Diver)
 
-Overview metadata:
-- Location: `.dive/overview.md`
-- Sections: `Components`, `Relationships`
-- Component entries support patterns like `**Name** - description -> target` or `Name: description -> target`
-- Relationship entries are bullet items under `Relationships`
+`overview.md` lives at `.dive/overview.md` and contains `Components` and `Relationships`.  
+Module files live at `.dive/modules/<module>.md` and contain `Files` and `Relationships`.
 
-Module metadata:
-- Location: `.dive/modules/<module>.md`
-- Sections: `Files`, `Relationships`
-- File entries support patterns like `` `path/to/file` - description `` or `path/to/file - description`
-- Relationship entries are bullet items under `Relationships`
-
-In-source directives:
-- `@dive-file:` file-level narrative summary (first occurrence used)
+In source files, the parser consumes:
+- `@dive-file:` file narrative summary (first occurrence used)
 - `@dive-rel:` semantic relationship statement (multiple supported)
 - `@dive:` line-level annotation captured with line number
-- Directive markers are read from common comment styles (`//`, `#`, `/* */`, `<!-- -->`, etc.)
 
 ## Current Limitations
 
-- Not a full compiler-grade program graph.
-- Not full symbol resolution across crate/workspace boundaries.
-- Not interprocedural control-flow/data-flow analysis.
-- Not alias-aware type-driven call resolution.
-- Not a perfect “ground truth” of architectural connectivity.
-
-Current connectivity is heuristic:
-- Semantic relationships from `.dive` provide intent-level context.
-- Static parser evidence (refs/calls/imports) provides observed structure.
-- Rendering policy prunes and highlights relations for navigability.
+This is not a compiler-grade program graph. Cross-workspace symbol resolution, interprocedural control/data-flow, and full type-aware call resolution are not implemented. Connectivity is heuristic by design: `.dive` expresses intent, static parsing contributes observed structure, and rendering policy prunes for navigability.
 
 ## Planned Work
 
-- Move from file-level inferred edges toward richer symbol-level graph structure.
-- Add stronger cross-reference indexing (definitions/references/calls) per language where reliable libraries exist.
-- Improve mid-layer blending so semantic hints guide grouping/query planning without hard layer boundaries.
-- Add explicit edge evidence and confidence presentation to improve review explainability.
+Next steps are richer symbol-level graph construction, stronger per-language xref indexing, better semantic/static blending in mid-level views, and clearer edge evidence/confidence presentation.
 
 ## LLM Skills
 
-- Skill definition: `skills/dive-tag/SKILL.md`
-- Format: standard `SKILL.md`
-- Compatible with agent harnesses that support `SKILL.md`-style skills
+`skills/dive-tag/SKILL.md` is a standard `SKILL.md` definition and can be used by agent harnesses that support this format.
 
 ## Useful Commands
 
 ```bash
-source ~/.zshrc && cargo check
-source ~/.zshrc && ASDF_NODEJS_VERSION=24.13.1 npm --prefix web run lint
-source ~/.zshrc && ASDF_NODEJS_VERSION=24.13.1 npm --prefix web run build
+cargo check
+npm --prefix web run lint
+npm --prefix web run build
 ```
