@@ -3,6 +3,8 @@
 Code Diver is a local system-mapping tool for code handoff and review.
 It combines `.dive` semantic metadata with static code signals, renders an explorable graph UI, and exposes the same read-only context through MCP.
 
+https://github.com/user-attachments/assets/4f45a9e3-6665-4909-a4ce-a684846be460
+
 ## Prerequisites
 
 - Rust (`stable`)
