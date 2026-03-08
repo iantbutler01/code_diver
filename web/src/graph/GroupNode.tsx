@@ -41,7 +41,7 @@ export function GroupNode({ data }: NodeProps) {
     .join("\n");
 
   return (
-    <div className={`node node-group ${d.isSummary ? "node-group-summary" : ""}`}>
+    <div className={`node node-group ${d.isSummary ? "node-group-summary" : ""} ${d.nonNavigable ? "node-group-anchor" : ""}`}>
       <Handle type="target" position={Position.Top} />
       <div className="node-header">
         <div className="node-group-title">{title}</div>
@@ -82,7 +82,7 @@ export function GroupNode({ data }: NodeProps) {
         )}
       </div>
       {!d.nonNavigable && <div className="node-hint">click to explore</div>}
-      {d.nonNavigable && <div className="node-hint">context anchor</div>}
+      {d.nonNavigable && <div className="node-hint">context anchor (not clickable)</div>}
       <Handle type="source" position={Position.Bottom} />
     </div>
   );

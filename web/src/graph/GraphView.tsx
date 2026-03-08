@@ -22,6 +22,7 @@ import { FileNode } from "./FileNode";
 import { TagNode } from "./TagNode";
 import { GroupNode } from "./GroupNode";
 import { FileGroupNode } from "./FileGroupNode";
+import { RelationEdge } from "./RelationEdge";
 import { openInVscode } from "../api";
 import { graphColors, minimapNodeColor } from "./colors";
 
@@ -32,6 +33,12 @@ const nodeTypes = {
   group: GroupNode,
   filegroup: FileGroupNode,
 };
+
+const edgeTypes = {
+  relation: RelationEdge,
+};
+
+const MODULE_DIR_FILTER_PREFIX = "moduledir::";
 
 interface Props {
   data: GraphData;
@@ -57,6 +64,7 @@ interface GraphNodeData {
   absPath?: string;
   isLeaf?: boolean;
   tagCount?: number;
+  hasDiveMeta?: boolean;
   path?: string;
   hasChildren?: boolean;
   moduleId?: string | null;
@@ -515,6 +523,15 @@ export function GraphView({ data, nav, onNavigate }: Props) {
 
       if (node.type === "group") {
         if (d.nonNavigable || d.isSummary) return;
+        if (typeof d.moduleId === "string" && d.moduleId.trim()) {
+          onNavigate({ level: "module", label: d.name || "Module", id: d.moduleId });
+          return;
+        }
+        const groupId = typeof d.groupId === "string" ? d.groupId : "";
+        if (groupId.startsWith(MODULE_DIR_FILTER_PREFIX)) {
+          onNavigate({ level: "module", label: d.name || "Group", id: groupId });
+          return;
+        }
         // Subsystem group: drill into filtered system view
         onNavigate({ level: "system", label: d.name || "Group", id: d.groupId });
       } else if (node.type === "filegroup") {
@@ -522,8 +539,13 @@ export function GraphView({ data, nav, onNavigate }: Props) {
           // Summary node in file view: open in VS Code
           if (d.absPath) openInVscode(d.absPath, 1);
         } else if (d.isLeaf) {
-          if (d.absPath) openInVscode(d.absPath, 1);
-        } else if ((d.tagCount || 0) > 0 && d.path) {
+          if ((d.hasDiveMeta || (d.tagCount || 0) > 0) && d.path) {
+            const fileName = d.path.split("/").pop() || d.path;
+            onNavigate({ level: "file", label: fileName, id: d.path });
+          } else if (d.absPath) {
+            openInVscode(d.absPath, 1);
+          }
+        } else if ((d.hasDiveMeta || (d.tagCount || 0) > 0) && d.path) {
           const fileName = d.path.split("/").pop() || d.path;
           onNavigate({ level: "file", label: fileName, id: d.path });
         } else if (d.absPath) {
@@ -543,12 +565,12 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         } else if (d.isReference && d.path) {
           const fileName = d.path.split("/").pop() || d.path;
           onNavigate({ level: "file", label: fileName, id: d.path });
-        } else if ((d.tagCount || 0) > 0 && d.path) {
-          // Has tags: drill into file level to see them
+        } else if ((d.hasDiveMeta || (d.tagCount || 0) > 0) && d.path) {
+          // Has dive metadata: drill into file level to show narrative/relations/tags.
           const fileName = d.path.split("/").pop() || d.path;
           onNavigate({ level: "file", label: fileName, id: d.path });
         } else if (d.absPath) {
-          // No tags: open in VS Code directly
+          // No dive metadata: open in VS Code directly.
           openInVscode(d.absPath, 1);
         }
       } else if (node.type === "tag") {
@@ -646,6 +668,7 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         onPaneClick={onPaneClick}
         onInit={onFlowInit}
         nodeTypes={nodeTypes}
+        edgeTypes={edgeTypes}
         fitView
         fitViewOptions={{ padding: 0.2 }}
         minZoom={0.1}

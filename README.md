@@ -1,22 +1,21 @@
 # Code Diver
 
-Code Diver is a local system-mapping tool for code handoff and review.  
-It blends `.dive` semantic metadata with static code signals, then renders an explorable graph and exposes the same context through MCP.
+Code Diver is a local system-mapping tool for code handoff and review.
+It combines `.dive` semantic metadata with static code signals, renders an explorable graph UI, and exposes the same read-only context through MCP.
 
 ## Prerequisites
 
-- Rust (`rust stable`; typically via `asdf`)
+- Rust (`stable`)
 - Node.js (for `web/` build)
-
-If you use `asdf`, run through shell init so shims resolve:
+- If using `asdf`, load shell init before running commands:
 
 ```bash
 source ~/.zshrc
 ```
 
-## Run
+## Build and Run
 
-Build frontend:
+Install and build frontend:
 
 ```bash
 source ~/.zshrc
@@ -37,6 +36,11 @@ Optional project path (default is current directory):
 cargo run -- /path/to/project --port 4000 --mcp-addr 127.0.0.1:4100
 ```
 
+Project root scope:
+- Start `code_diver` from the root of the project being analyzed, or pass that root as `PROJECT_PATH`.
+- Graph discovery is scoped to that root. Launching from a subdirectory will exclude metadata and source files outside that subtree.
+- Metadata discovery expects `.dive/overview.md` and `.dive/modules/*.md` under the selected root.
+
 ## Endpoints
 
 - UI: `http://127.0.0.1:4000/`
@@ -45,15 +49,35 @@ cargo run -- /path/to/project --port 4000 --mcp-addr 127.0.0.1:4100
 - Markdown render source: `http://127.0.0.1:4000/api/markdown?path=<project-relative.md>`
 - MCP: `http://127.0.0.1:4100/mcp` (or your `--mcp-addr`)
 
-## What Exists Today
+## Current Implementation
 
-- `.dive` parser for overview/modules/file tags + diagnostics for unparsed lines/duplicates.
-- Tree-sitter-backed static extraction for Rust/TypeScript/JavaScript/Python/Go.
-- Static edges from import/call evidence with confidence/weight scoring.
-- Graph transform that blends static and semantic edges for display policy.
-- Read-only MCP tools for overview, group drilldown, module/file context, relationship trace, markdown, and parser diagnostics.
+- `.dive` parser for overview/modules/file tags, with diagnostics for unparsed lines and duplicate component names.
+- Tree-sitter-backed static extraction for Rust, TypeScript, JavaScript, Python, and Go.
+- Static relation inference from import and call evidence with weight/confidence scoring.
+- Graph transformation pipeline that blends semantic and static relations for rendering policy.
+- Read-only MCP surface for overview, group drilldown, module/file context, relationship trace, markdown, and parser diagnostics.
 
-## What This Is Not (Yet)
+## Dive Format (Consumed by Code Diver)
+
+Overview metadata:
+- Location: `.dive/overview.md`
+- Sections: `Components`, `Relationships`
+- Component entries support patterns like `**Name** - description -> target` or `Name: description -> target`
+- Relationship entries are bullet items under `Relationships`
+
+Module metadata:
+- Location: `.dive/modules/<module>.md`
+- Sections: `Files`, `Relationships`
+- File entries support patterns like `` `path/to/file` - description `` or `path/to/file - description`
+- Relationship entries are bullet items under `Relationships`
+
+In-source directives:
+- `@dive-file:` file-level narrative summary (first occurrence used)
+- `@dive-rel:` semantic relationship statement (multiple supported)
+- `@dive:` line-level annotation captured with line number
+- Directive markers are read from common comment styles (`//`, `#`, `/* */`, `<!-- -->`, etc.)
+
+## Current Limitations
 
 - Not a full compiler-grade program graph.
 - Not full symbol resolution across crate/workspace boundaries.
@@ -61,23 +85,17 @@ cargo run -- /path/to/project --port 4000 --mcp-addr 127.0.0.1:4100
 - Not alias-aware type-driven call resolution.
 - Not a perfect “ground truth” of architectural connectivity.
 
-Current graph connectivity is an informed heuristic blend:
-- semantic relationships from `.dive` (the stated “why”)
-- static evidence from parser-derived refs/calls/imports (the observed “what”)
-- layout/display policies to keep it explorable
+Current connectivity is heuristic:
+- Semantic relationships from `.dive` provide intent-level context.
+- Static parser evidence (refs/calls/imports) provides observed structure.
+- Rendering policy prunes and highlights relations for navigability.
 
-## Code Analysis: Already Done vs Next Steps
+## Planned Work
 
-What is already implemented:
-- Added real parser libraries (Tree-sitter language grammars) instead of regex-only extraction.
-- Added static-analysis payload into the API and frontend graph policy path.
-- Kept `.dive` format untouched and merged it as guidance/hints rather than replacing it.
-
-Next steps:
-- Move from file-level inferred edges toward richer graph structure (symbol-level and relation-type aware).
+- Move from file-level inferred edges toward richer symbol-level graph structure.
 - Add stronger cross-reference indexing (definitions/references/calls) per language where reliable libraries exist.
-- Improve mid-layer blending logic so semantic hints shape query planning and grouping without hard layer boundaries.
-- Add better confidence/explainability on each displayed edge so reviewers can see why two nodes are connected.
+- Improve mid-layer blending so semantic hints guide grouping/query planning without hard layer boundaries.
+- Add explicit edge evidence and confidence presentation to improve review explainability.
 
 ## LLM Skills
 

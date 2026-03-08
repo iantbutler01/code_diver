@@ -557,7 +557,19 @@ body {
 
 .node-group-summary {
   border-style: dashed;
-  background: var(--color-node-group-soft);
+  background: #1a2140;
+}
+
+.node-group-anchor {
+  border-color: #64748b;
+  border-left: 3px solid #475569;
+  background: #111827;
+  cursor: default;
+}
+
+.node-group-anchor:hover {
+  border-color: #64748b;
+  box-shadow: none;
 }
 
 .node-group-title {
@@ -606,6 +618,19 @@ body {
   border-radius: 3px;
   white-space: normal;
   word-break: break-word;
+}
+
+.node-group-anchor .node-group-title {
+  color: #cbd5e1;
+}
+
+.node-group-anchor .node-group-count,
+.node-group-anchor .node-hint {
+  color: #94a3b8;
+}
+
+.node-group-anchor .node-group-item {
+  background: rgba(100, 116, 139, 0.14);
 }
 
 .node-group-more {
@@ -857,6 +882,17 @@ body {
 
 .react-flow__node {
   z-index: 31 !important;
+}
+
+.react-flow__node-group {
+  padding: 0 !important;
+  border: none !important;
+  border-radius: 0 !important;
+  width: auto !important;
+  background: transparent !important;
+  color: inherit !important;
+  font-size: inherit !important;
+  text-align: inherit !important;
 }
 
 .react-flow__edge-textbg {

@@ -45,6 +45,12 @@ interface ComponentGroup {
   label: string;
 }
 
+interface ModuleComponentBucket {
+  id: string;
+  label: string;
+  comps: ComponentRecord[];
+}
+
 interface EdgeData extends Record<string, unknown> {
   kind?: "structure" | "relationship";
   layout?: boolean;
@@ -58,6 +64,8 @@ interface EdgeData extends Record<string, unknown> {
   policySelected?: boolean;
   policySuppressed?: boolean;
   policyReason?: string[];
+  parallelCentered?: number;
+  parallelCount?: number;
 }
 
 interface WeightedDirectedEdge {
@@ -80,6 +88,7 @@ interface PlannerNodeData {
   target?: string | null;
   moduleId?: string | null;
   dirPath?: string | null;
+  children?: string[];
 }
 
 interface RelationCandidate {
@@ -88,6 +97,8 @@ interface RelationCandidate {
   target: string;
   score: number;
   weight: number;
+  hasSemantic: boolean;
+  hasStatic: boolean;
   reasons: string[];
 }
 
@@ -141,6 +152,9 @@ const CONFIG_SEGMENTS = new Set([
   "deploy",
   "deployment",
 ]);
+
+const MODULE_CLUSTER_PREFIX = "modulecluster::";
+const MODULE_DIR_FILTER_PREFIX = "moduledir::";
 
 /** Strip common markdown wrappers and whitespace from target tokens. */
 function cleanTarget(t: string | null): string | null {
@@ -250,6 +264,7 @@ function classifyComponentGroup(target: string | null): ComponentGroup {
 }
 
 function groupLabelFromId(groupId: string): string {
+  if (groupId === "__all__") return "system";
   if (groupId === "other") return "other";
   if (groupId === "semantic:tests") return "tests";
   if (groupId === "semantic:specs") return "specs";
@@ -299,6 +314,7 @@ function deriveFolderHints(
 }
 
 function matchesGroup(comp: ComponentRecord, groupId: string): boolean {
+  if (groupId === "__all__") return true;
   const bucket = classifyComponentGroup(comp.target);
   if (bucket.id === groupId) return true;
 
@@ -309,6 +325,98 @@ function matchesGroup(comp: ComponentRecord, groupId: string): boolean {
   }
 
   return false;
+}
+
+function makeModuleClusterFilterId(baseGroupId: string, moduleBucketId: string): string {
+  return `${MODULE_CLUSTER_PREFIX}${encodeURIComponent(baseGroupId)}::${encodeURIComponent(moduleBucketId)}`;
+}
+
+function parseModuleClusterFilterId(
+  filterId: string
+): { baseGroupId: string; moduleBucketId: string } | null {
+  if (!filterId.startsWith(MODULE_CLUSTER_PREFIX)) return null;
+  const payload = filterId.slice(MODULE_CLUSTER_PREFIX.length);
+  const sep = payload.indexOf("::");
+  if (sep < 0) return null;
+
+  const rawGroup = payload.slice(0, sep);
+  const rawBucket = payload.slice(sep + 2);
+  if (!rawGroup || !rawBucket) return null;
+
+  try {
+    const baseGroupId = decodeURIComponent(rawGroup);
+    const moduleBucketId = decodeURIComponent(rawBucket);
+    if (!baseGroupId || !moduleBucketId) return null;
+    return { baseGroupId, moduleBucketId };
+  } catch {
+    return null;
+  }
+}
+
+function makeModuleDirFilterId(moduleId: string, dirPrefix: string): string {
+  return `${MODULE_DIR_FILTER_PREFIX}${encodeURIComponent(moduleId)}::${encodeURIComponent(dirPrefix)}`;
+}
+
+function parseModuleDirFilterId(
+  raw: string
+): { moduleId: string; dirPrefix: string } | null {
+  if (!raw.startsWith(MODULE_DIR_FILTER_PREFIX)) return null;
+  const payload = raw.slice(MODULE_DIR_FILTER_PREFIX.length);
+  const sep = payload.indexOf("::");
+  if (sep < 0) return null;
+
+  const left = payload.slice(0, sep);
+  const right = payload.slice(sep + 2);
+  if (!left || !right) return null;
+
+  try {
+    const moduleId = decodeURIComponent(left);
+    const dirPrefix = normalizeTargetPath(decodeURIComponent(right));
+    if (!moduleId || !dirPrefix) return null;
+    return { moduleId, dirPrefix };
+  } catch {
+    return null;
+  }
+}
+
+function buildModuleBuckets(
+  data: GraphData,
+  components: ComponentRecord[]
+): Map<string, ModuleComponentBucket> {
+  const buckets = new Map<string, ModuleComponentBucket>();
+
+  for (const comp of components) {
+    const byTarget = comp.target ? findModuleByTarget(data, comp.target) : undefined;
+    const byName = byTarget ? undefined : findModule(data, comp.name);
+    const moduleRef = byTarget || byName;
+    const bucketId = moduleRef?.name || "__unmapped__";
+    const bucketLabel = moduleRef?.title?.trim() || moduleRef?.name || "unmapped";
+    const bucket = buckets.get(bucketId) || {
+      id: bucketId,
+      label: bucketLabel,
+      comps: [],
+    };
+    bucket.comps.push(comp);
+    buckets.set(bucketId, bucket);
+  }
+
+  return buckets;
+}
+
+function shouldUseModuleClusters(
+  components: ComponentRecord[],
+  buckets: Map<string, ModuleComponentBucket>
+): boolean {
+  if (components.length < 2) return false;
+  if (buckets.size < 2) return false;
+
+  let mappedBuckets = 0;
+  for (const bucket of buckets.values()) {
+    if (bucket.id === "__unmapped__") continue;
+    if (bucket.comps.length > 0) mappedBuckets += 1;
+  }
+
+  return mappedBuckets >= 2;
 }
 
 function prepareComponents(components: ComponentEntry[]): ComponentRecord[] {
@@ -392,6 +500,54 @@ function addRelationshipEdge(
       evidence: ["semantic"],
     },
   });
+}
+
+function pushBundledRelationshipEdges(
+  edges: Edge[],
+  aggregated: Map<
+    string,
+    {
+      source: string;
+      target: string;
+      count: number;
+      labels: Set<string>;
+      ambiguous: boolean;
+    }
+  >
+) {
+  let index = 0;
+  for (const entry of aggregated.values()) {
+    const labels = [...entry.labels].filter((label) => label.trim().length > 0);
+
+    let label = "";
+    if (entry.count > 1) {
+      label = `x${entry.count}`;
+    }
+    if (labels.length === 1) {
+      label = label ? `${label} ${labels[0]}` : labels[0];
+    } else if (labels.length > 1) {
+      const suffix = `${labels.length} rel types`;
+      label = label ? `${label} (${suffix})` : suffix;
+    }
+
+    edges.push({
+      id: `e-grp-bundle-${index}`,
+      source: entry.source,
+      target: entry.target,
+      label: label || undefined,
+      animated: true,
+      style: entry.ambiguous
+        ? { stroke: graphColors.edgeAmbiguous, strokeWidth: 1.5, strokeDasharray: "5,4" }
+        : { stroke: graphColors.edgeRelationship, strokeWidth: 1.5 },
+      data: {
+        layout: false,
+        kind: "relationship",
+        bundledCount: entry.count,
+        ambiguous: entry.ambiguous,
+      },
+    });
+    index += 1;
+  }
 }
 
 function relationLayoutWeight(edge: Edge): number {
@@ -875,6 +1031,11 @@ function nodePathCandidates(node: Node): string[] {
 
   add(data.path);
   add(data.target || undefined);
+  if (Array.isArray(data.children)) {
+    for (const child of data.children) {
+      add(child);
+    }
+  }
 
   return [...candidates];
 }
@@ -1210,35 +1371,36 @@ function applyConnectivityPolicy(
     const data = edge.data as EdgeData | undefined;
     const weight = relationLayoutWeight(edge);
     const reasons: string[] = [];
-    let score = weight * 1.35;
+    let score = Math.min(5, weight) * 0.9;
     reasons.push(`weight:${weight}`);
     const evidenceSet = edgeEvidence(data);
     const hasStatic = evidenceSet.has("static");
     const hasSemantic = evidenceSet.has("semantic");
 
-    if (hasStatic) {
-      score += 1.25;
-      reasons.push("static");
-    }
     if (hasSemantic) {
-      score += 0.55;
+      score += 2.6;
       reasons.push("semantic");
     }
+    if (hasStatic) {
+      score += hasSemantic ? 0.55 : 0.45;
+      reasons.push("static");
+    }
     if (hasStatic && hasSemantic) {
-      score += 0.8;
+      score += 0.6;
       reasons.push("blended");
     }
     if (typeof data?.staticConfidence === "number") {
-      score += Math.max(0, Math.min(1, data.staticConfidence)) * 1.1;
+      const confidence = Math.max(0, Math.min(1, data.staticConfidence));
+      score += confidence * (hasSemantic ? 0.35 : 0.8);
       reasons.push(`confidence:${Number(data.staticConfidence).toFixed(2)}`);
     }
     if (typeof data?.staticKind === "string" && data.staticKind.length > 0) {
       if (data.staticKind.includes("calls")) {
-        score += 0.28;
+        score += hasSemantic ? 0.22 : 0.18;
         reasons.push("calls");
       }
       if (data.staticKind.includes("imports")) {
-        score += 0.16;
+        score += 0.12;
         reasons.push("imports");
       }
     }
@@ -1279,6 +1441,8 @@ function applyConnectivityPolicy(
       target: edge.target,
       score,
       weight,
+      hasSemantic,
+      hasStatic,
       reasons,
     });
   }
@@ -1294,7 +1458,17 @@ function applyConnectivityPolicy(
   });
 
   const budget = relationVisibilityBudget(nav.level, nodes.length, ranked.length);
-  const selected = new Set<number>(ranked.slice(0, budget).map((c) => c.index));
+  const semanticRanked = ranked.filter((candidate) => candidate.hasSemantic);
+  const effectiveBudget = Math.max(budget, semanticRanked.length);
+
+  const selected = new Set<number>();
+  for (const candidate of semanticRanked) {
+    selected.add(candidate.index);
+  }
+  for (const candidate of ranked) {
+    if (selected.size >= effectiveBudget) break;
+    selected.add(candidate.index);
+  }
 
   const nodesWithRelations = new Set<string>();
   for (const c of candidates) {
@@ -1322,7 +1496,7 @@ function applyConnectivityPolicy(
     coveredNodes.add(fallback.target);
   }
 
-  const maxSelected = budget + Math.ceil(nodesWithRelations.size * 0.2);
+  const maxSelected = effectiveBudget + Math.ceil(nodesWithRelations.size * 0.2);
   if (selected.size > maxSelected) {
     const selectedIncident = new Map<string, number>();
     for (const c of candidates) {
@@ -1337,6 +1511,7 @@ function applyConnectivityPolicy(
 
     for (const candidate of selectedByAscendingScore) {
       if (selected.size <= maxSelected) break;
+      if (candidate.hasSemantic) continue;
       const sourceCount = selectedIncident.get(candidate.source) || 0;
       const targetCount = selectedIncident.get(candidate.target) || 0;
       if (sourceCount <= 1 || targetCount <= 1) continue;
@@ -1419,6 +1594,74 @@ function applyConnectivityPolicy(
   });
 }
 
+function separateParallelRelationEdges(edges: Edge[]): Edge[] {
+  const relationGroups = new Map<string, number[]>();
+  const next = edges.map((edge) => {
+    const data = edge.data as EdgeData | undefined;
+    if (data?.kind !== "relationship") return edge;
+    return {
+      ...edge,
+      type: "relation",
+      labelShowBg: true,
+      labelBgPadding: [7, 4] as [number, number],
+      labelBgBorderRadius: 4,
+      labelStyle: {
+        ...(edge.labelStyle || {}),
+        fontSize: 11,
+        whiteSpace: "normal",
+        maxWidth: 300,
+      },
+      data: {
+        ...(data || {}),
+        parallelCentered: 0,
+        parallelCount: 1,
+      },
+    };
+  });
+
+  for (let i = 0; i < next.length; i += 1) {
+    const edge = next[i];
+    const data = edge.data as EdgeData | undefined;
+    if (data?.kind !== "relationship") continue;
+    if (edge.hidden) continue;
+    const key = `${edge.source}->${edge.target}`;
+    const group = relationGroups.get(key) || [];
+    group.push(i);
+    relationGroups.set(key, group);
+  }
+
+  if (![...relationGroups.values()].some((group) => group.length > 1)) {
+    return next;
+  }
+
+  for (const group of relationGroups.values()) {
+    if (group.length <= 1) continue;
+
+    for (let lane = 0; lane < group.length; lane += 1) {
+      const edgeIndex = group[lane];
+      const edge = next[edgeIndex];
+      if (!edge) continue;
+
+      const centered = lane - (group.length - 1) / 2;
+      const labelShift = Math.round(centered * 6);
+      next[edgeIndex] = {
+        ...edge,
+        labelStyle: {
+          ...(edge.labelStyle || {}),
+          transform: `translate(0px, ${labelShift}px)`,
+        },
+        data: {
+          ...((edge.data as EdgeData | undefined) || {}),
+          parallelCentered: centered,
+          parallelCount: group.length,
+        },
+      };
+    }
+  }
+
+  return next;
+}
+
 export function transformGraph(
   data: GraphData,
   nav: NavEntry
@@ -1426,16 +1669,17 @@ export function transformGraph(
   let result: { nodes: Node[]; edges: Edge[] };
 
   if (nav.level === "system") result = systemLevel(data, nav.id);
-  else if (nav.level === "module") result = moduleLevel(data, nav.id!);
+  else if (nav.level === "module") result = moduleLevel(data, nav.id!, nav.label);
   else if (nav.level === "file") result = fileLevel(data, nav.id!);
   else result = { nodes: [], edges: [] };
 
   if (result.nodes.length > 0) {
     const withStatic = addStaticRelationships(data, nav, result.nodes, result.edges);
     const withBackbone = addGeneratedLayoutBackbone(result.nodes, withStatic);
+    const withPolicy = applyConnectivityPolicy(result.nodes, withBackbone, nav);
     result = {
       nodes: result.nodes,
-      edges: applyConnectivityPolicy(result.nodes, withBackbone, nav),
+      edges: separateParallelRelationEdges(withPolicy),
     };
   }
 
@@ -1472,17 +1716,24 @@ function systemLevel(
   }
 
   if (ov && ov.components.length > CLUSTER_THRESHOLD) {
-    return aggregatedSystemLevel(ov);
+    return aggregatedSystemLevel(data, ov);
   }
 
   return flatSystemLevel(data);
 }
 
-function aggregatedSystemLevel(ov: OverviewDoc): { nodes: Node[]; edges: Edge[] } {
+function aggregatedSystemLevel(
+  data: GraphData,
+  ov: OverviewDoc
+): { nodes: Node[]; edges: Edge[] } {
+  const components = prepareComponents(ov.components);
+  const moduleBuckets = buildModuleBuckets(data, components);
+  if (shouldUseModuleClusters(components, moduleBuckets)) {
+    return moduleClusterSystemLevel(ov, "__all__", "system", components, moduleBuckets);
+  }
+
   const nodes: Node[] = [];
   const edges: Edge[] = [];
-
-  const components = prepareComponents(ov.components);
 
   const groups = new Map<string, { label: string; comps: ComponentRecord[] }>();
   for (const comp of components) {
@@ -1559,39 +1810,7 @@ function aggregatedSystemLevel(ov: OverviewDoc): { nodes: Node[]; edges: Edge[] 
     }
   }
 
-  let index = 0;
-  for (const entry of aggregated.values()) {
-    const labels = [...entry.labels].filter((label) => label.trim().length > 0);
-
-    let label = "";
-    if (entry.count > 1) {
-      label = `x${entry.count}`;
-    }
-    if (labels.length === 1) {
-      label = label ? `${label} ${labels[0]}` : labels[0];
-    } else if (labels.length > 1) {
-      const suffix = `${labels.length} rel types`;
-      label = label ? `${label} (${suffix})` : suffix;
-    }
-
-    edges.push({
-      id: `e-grp-bundle-${index}`,
-      source: entry.source,
-      target: entry.target,
-      label: label || undefined,
-      animated: true,
-      style: entry.ambiguous
-        ? { stroke: graphColors.edgeAmbiguous, strokeWidth: 1.5, strokeDasharray: "5,4" }
-        : { stroke: graphColors.edgeRelationship, strokeWidth: 1.5 },
-      data: {
-        layout: false,
-        kind: "relationship",
-        bundledCount: entry.count,
-        ambiguous: entry.ambiguous,
-      },
-    });
-    index += 1;
-  }
+  pushBundledRelationshipEdges(edges, aggregated);
 
   return { nodes, edges };
 }
@@ -1601,19 +1820,147 @@ function filteredSystemLevel(
   ov: OverviewDoc,
   groupId: string
 ): { nodes: Node[]; edges: Edge[] } {
-  const components = prepareComponents(ov.components).filter((c) => matchesGroup(c, groupId));
-  const label = groupLabelFromId(groupId);
+  const moduleFilter = parseModuleClusterFilterId(groupId);
+  const baseGroupId = moduleFilter?.baseGroupId || groupId;
+  const prepared = prepareComponents(ov.components);
+  const allComponents =
+    baseGroupId === "__all__"
+      ? prepared
+      : prepared.filter((c) => matchesGroup(c, baseGroupId));
+  const baseLabel = groupLabelFromId(baseGroupId);
 
-  return buildComponentNodes(data, ov, components, {
+  if (moduleFilter) {
+    const buckets = buildModuleBuckets(data, allComponents);
+    const selected = buckets.get(moduleFilter.moduleBucketId);
+    const components = selected?.comps || [];
+    const moduleLabel = selected?.label || moduleFilter.moduleBucketId;
+    return buildComponentNodes(data, ov, components, {
+      parentSummary: {
+        groupId,
+        label: `${baseLabel} · ${moduleLabel}`,
+        totalComponents: components.length,
+        componentNames: components.map((c) => c.name),
+        folderHints: deriveFolderHints(components, baseGroupId),
+      },
+      fileGroupsAreLeaf: true,
+    });
+  }
+
+  const moduleBuckets = buildModuleBuckets(data, allComponents);
+  if (shouldUseModuleClusters(allComponents, moduleBuckets)) {
+    return moduleClusterSystemLevel(ov, baseGroupId, baseLabel, allComponents, moduleBuckets);
+  }
+
+  return buildComponentNodes(data, ov, allComponents, {
     parentSummary: {
-      groupId,
-      label,
-      totalComponents: components.length,
-      componentNames: components.map((c) => c.name),
-      folderHints: deriveFolderHints(components, groupId),
+      groupId: baseGroupId,
+      label: baseLabel,
+      totalComponents: allComponents.length,
+      componentNames: allComponents.map((c) => c.name),
+      folderHints: deriveFolderHints(allComponents, baseGroupId),
     },
     fileGroupsAreLeaf: true,
   });
+}
+
+function moduleClusterSystemLevel(
+  ov: OverviewDoc,
+  baseGroupId: string,
+  baseLabel: string,
+  allComponents: ComponentRecord[],
+  moduleBuckets: Map<string, ModuleComponentBucket>
+): { nodes: Node[]; edges: Edge[] } {
+  const nodes: Node[] = [];
+  const edges: Edge[] = [];
+
+  const summaryNodeId = `summary-group:${baseGroupId}:modules`;
+  nodes.push({
+    id: summaryNodeId,
+    type: "group",
+    position: { x: 0, y: 0 },
+    data: {
+      name: `${baseLabel} modules`,
+      count: allComponents.length,
+      children: allComponents.map((c) => c.name),
+      groupId: baseGroupId,
+      folderHints: deriveFolderHints(allComponents, baseGroupId),
+      isSummary: true,
+      nonNavigable: true,
+    },
+  });
+
+  const orderedBuckets = [...moduleBuckets.values()].sort((a, b) => {
+    if (a.id === "__unmapped__" && b.id !== "__unmapped__") return 1;
+    if (b.id === "__unmapped__" && a.id !== "__unmapped__") return -1;
+    if (b.comps.length !== a.comps.length) return b.comps.length - a.comps.length;
+    return a.label.localeCompare(b.label);
+  });
+
+  const nameToGroups = new Map<string, Set<string>>();
+  for (const bucket of orderedBuckets) {
+    if (bucket.comps.length === 0) continue;
+
+    const filterId = makeModuleClusterFilterId(baseGroupId, bucket.id);
+    const nodeId = `group:${filterId}`;
+    nodes.push({
+      id: nodeId,
+      type: "group",
+      position: { x: 0, y: 0 },
+      data: {
+        name: bucket.label,
+        count: bucket.comps.length,
+        children: bucket.comps.map((c) => c.name),
+        groupId: filterId,
+        moduleId: bucket.id === "__unmapped__" ? null : bucket.id,
+        folderHints: deriveFolderHints(bucket.comps, baseGroupId),
+      },
+    });
+    addStructuralEdge(edges, summaryNodeId, nodeId);
+
+    for (const comp of bucket.comps) {
+      addNameNodeMapping(nameToGroups, comp.normName, nodeId);
+    }
+  }
+
+  const rels = parseRelationships(ov.relationships);
+  const aggregated = new Map<
+    string,
+    {
+      source: string;
+      target: string;
+      count: number;
+      labels: Set<string>;
+      ambiguous: boolean;
+    }
+  >();
+
+  for (const rel of rels) {
+    const srcGroups = [...(nameToGroups.get(normalizeName(rel.src)) || [])];
+    const tgtGroups = [...(nameToGroups.get(normalizeName(rel.tgt)) || [])];
+    if (srcGroups.length === 0 || tgtGroups.length === 0) continue;
+
+    const ambiguous = srcGroups.length > 1 || tgtGroups.length > 1;
+    for (const src of srcGroups) {
+      for (const tgt of tgtGroups) {
+        if (src === tgt) continue;
+        const key = `${src}->${tgt}`;
+        const entry = aggregated.get(key) || {
+          source: src,
+          target: tgt,
+          count: 0,
+          labels: new Set<string>(),
+          ambiguous: false,
+        };
+        entry.count += 1;
+        if (rel.label) entry.labels.add(rel.label);
+        entry.ambiguous = entry.ambiguous || ambiguous;
+        aggregated.set(key, entry);
+      }
+    }
+  }
+
+  pushBundledRelationshipEdges(edges, aggregated);
+  return { nodes, edges };
 }
 
 function buildComponentNodes(
@@ -1667,6 +2014,7 @@ function buildComponentNodes(
       ? parent.target!
       : `${parent.target!}/`;
     const nodeId = `group:${parent.key}`;
+    const resolvedModule = findModuleByTarget(data, dirPath) || findModule(data, parent.name);
 
     nodes.push({
       id: nodeId,
@@ -1677,6 +2025,7 @@ function buildComponentNodes(
         count: children.length,
         children: children.map((c) => c.name),
         groupId: dirPath,
+        moduleId: resolvedModule?.name || null,
         folderHints: deriveFolderHints([parent, ...children], dirPath),
         hasNameCollision: duplicateNames.has(parent.normName),
       },
@@ -1752,6 +2101,8 @@ function buildComponentNodes(
           description: t.description,
         })),
         tagCount: fileDoc?.tags.length || 0,
+        hasDiveMeta:
+          !!fileDoc && (!!fileDoc.dive_file || fileDoc.dive_rel.length > 0 || fileDoc.tags.length > 0),
         moduleId: mod?.name || null,
         collapsedCount: comps.length,
         collapsedNames: comps.map((c) => c.name),
@@ -1901,21 +2252,169 @@ function flatSystemLevel(data: GraphData): { nodes: Node[]; edges: Edge[] } {
 
 // ─── Module Level ──────────────────────────────────────────────────────
 
+interface ModuleFileRecord {
+  path: string;
+  absPath: string;
+  description: string;
+  tagCount: number;
+  hasDiveMeta: boolean;
+}
+
+function moduleRootPrefix(paths: string[]): string {
+  const clean = paths
+    .map((path) => normalizeTargetPath(path).replace(/\/\*.*$/, ""))
+    .filter(Boolean)
+    .map((path) => {
+      const parts = path.split("/").filter(Boolean);
+      if (parts.length <= 1) return path;
+      const last = parts[parts.length - 1] || "";
+      return last.includes(".") ? parts.slice(0, -1).join("/") : path;
+    });
+
+  if (clean.length === 0) return "";
+  let prefix = clean[0];
+  for (let i = 1; i < clean.length; i += 1) {
+    const current = clean[i];
+    while (prefix && !current.startsWith(prefix)) {
+      const cut = prefix.lastIndexOf("/");
+      if (cut < 0) {
+        prefix = "";
+        break;
+      }
+      prefix = prefix.slice(0, cut);
+    }
+  }
+  return prefix;
+}
+
+function collectModuleFiles(data: GraphData, mod: ModuleDoc): ModuleFileRecord[] {
+  const files = new Map<string, ModuleFileRecord>();
+  const declaredPaths = mod.files
+    .map((entry) => normalizeTargetPath(entry.path).replace(/\/\*.*$/, ""))
+    .filter(Boolean);
+  const declaredRootPrefix = moduleRootPrefix(declaredPaths);
+  const moduleNamePrefix = normalizeTargetPath(mod.name);
+  const add = (path: string, description: string, fileDoc?: FileDiveDoc) => {
+    const normalized = normalizeTargetPath(path);
+    if (!normalized) return;
+    if (files.has(normalized)) return;
+    const hasDiveMetaFromFile =
+      !!fileDoc && (!!fileDoc.dive_file || fileDoc.dive_rel.length > 0 || fileDoc.tags.length > 0);
+    const hasDiveMetaFromModuleDoc = description.trim().length > 0;
+    files.set(normalized, {
+      path: normalized,
+      absPath: fileDoc?.abs_path || `${data.project_root}/${normalized}`,
+      description: description || fileDoc?.dive_file || "",
+      tagCount: fileDoc?.tags.length || 0,
+      hasDiveMeta: hasDiveMetaFromFile || hasDiveMetaFromModuleDoc,
+    });
+  };
+
+  for (const fileRef of mod.files) {
+    const rawPath = normalizeTargetPath(fileRef.path);
+    if (!rawPath) continue;
+    const wildcard = rawPath.includes("*");
+    if (!wildcard) {
+      const fileDoc = data.files.find(
+        (file) => file.path === rawPath || file.path.endsWith(rawPath)
+      );
+      add(rawPath, fileRef.description, fileDoc);
+      continue;
+    }
+
+    const prefix = normalizeTargetPath(rawPath.replace(/\*.*$/, ""));
+    if (!prefix) continue;
+    for (const file of data.files) {
+      if (file.path.startsWith(prefix)) {
+        add(file.path, fileRef.description, file);
+      }
+    }
+  }
+
+  for (const file of data.files) {
+    if (files.has(file.path)) continue;
+    const normalizedPath = normalizeTargetPath(file.path);
+    const inDeclaredRoot = declaredRootPrefix
+      ? normalizedPath === declaredRootPrefix ||
+        normalizedPath.startsWith(`${declaredRootPrefix}/`)
+      : false;
+    const inModulePrefix = moduleNamePrefix
+      ? normalizedPath === moduleNamePrefix ||
+        normalizedPath.startsWith(`${moduleNamePrefix}/`)
+      : false;
+
+    const shouldInclude = declaredRootPrefix
+      ? inDeclaredRoot
+      : inModulePrefix;
+    if (shouldInclude) {
+      add(normalizedPath, file.dive_file || `${file.tags.length} tags`, file);
+    }
+  }
+
+  return [...files.values()].sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function bucketModuleFilesByNextDir(
+  files: ModuleFileRecord[],
+  scopePrefix: string | null,
+  rootPrefix: string
+): Map<string, ModuleFileRecord[]> {
+  const buckets = new Map<string, ModuleFileRecord[]>();
+
+  for (const file of files) {
+    const path = normalizeTargetPath(file.path);
+    if (!path) continue;
+
+    if (scopePrefix && !(path === scopePrefix || path.startsWith(`${scopePrefix}/`))) {
+      continue;
+    }
+
+    let relative = path;
+    let anchoredToRoot = false;
+    if (scopePrefix) {
+      relative = relative.slice(scopePrefix.length).replace(/^\/+/, "");
+    } else if (rootPrefix && (relative === rootPrefix || relative.startsWith(`${rootPrefix}/`))) {
+      relative = relative.slice(rootPrefix.length).replace(/^\/+/, "");
+      anchoredToRoot = true;
+    }
+
+    const parts = relative.split("/").filter(Boolean);
+    if (parts.length <= 1) continue;
+
+    const next = parts[0];
+    const bucketPrefix = scopePrefix
+      ? `${scopePrefix}/${next}`
+      : anchoredToRoot && rootPrefix
+        ? `${rootPrefix}/${next}`
+        : next;
+    const list = buckets.get(bucketPrefix) || [];
+    list.push(file);
+    buckets.set(bucketPrefix, list);
+  }
+
+  return buckets;
+}
+
 function moduleLevel(
   data: GraphData,
-  moduleId: string
+  moduleId: string,
+  navLabel?: string
 ): { nodes: Node[]; edges: Edge[] } {
   const nodes: Node[] = [];
   const edges: Edge[] = [];
 
-  const mod = findModule(data, moduleId);
+  const dirFilter = parseModuleDirFilterId(moduleId);
+  const baseModuleId = dirFilter?.moduleId || moduleId;
+  const scopePrefix = dirFilter?.dirPrefix || null;
+
+  const mod = findModule(data, baseModuleId);
   if (mod) {
-    buildModuleNodes(data, mod, nodes, edges);
+    buildModuleNodes(data, mod, nodes, edges, scopePrefix, navLabel);
     return { nodes, edges };
   }
 
   const dirFiles = data.files.filter(
-    (file) => file.path.startsWith(`${moduleId}/`) || file.path.startsWith(moduleId)
+    (file) => file.path.startsWith(`${baseModuleId}/`) || file.path.startsWith(baseModuleId)
   );
 
   if (dirFiles.length > 0) {
@@ -1927,7 +2426,7 @@ function moduleLevel(
   }
 
   const rawComp = data.overview?.components.find(
-    (comp) => comp.name.toLowerCase() === moduleId.toLowerCase()
+    (comp) => comp.name.toLowerCase() === baseModuleId.toLowerCase()
   );
   const comp = rawComp ? { ...rawComp, target: cleanTarget(rawComp.target) } : undefined;
 
@@ -1944,7 +2443,7 @@ function moduleLevel(
     if (comp.target) {
       const targetModule = findModuleByTarget(data, comp.target);
       if (targetModule) {
-        buildModuleNodes(data, targetModule, nodes, edges);
+        buildModuleNodes(data, targetModule, nodes, edges, scopePrefix, navLabel);
         return { nodes, edges };
       }
 
@@ -1957,13 +2456,14 @@ function moduleLevel(
           absPath: `${data.project_root}/${comp.target}`,
           description: comp.description || "No dive tags in this file yet",
           tagCount: 0,
+          hasDiveMeta: !!comp.description,
         },
       });
       return { nodes, edges };
     }
   }
 
-  const lower = normalizeName(moduleId);
+  const lower = normalizeName(baseModuleId);
   for (const file of data.files) {
     const pathNorm = normalizeName(file.path);
     if (pathNorm.includes(lower)) {
@@ -1979,48 +2479,107 @@ function buildModuleNodes(
   data: GraphData,
   mod: ModuleDoc,
   nodes: Node[],
-  edges: Edge[]
+  edges: Edge[],
+  scopePrefix: string | null,
+  navLabel?: string
 ) {
-  const seen = new Set<string>();
+  const allFiles = collectModuleFiles(data, mod);
+  const rootPrefix = moduleRootPrefix(mod.files.map((entry) => entry.path));
+  const visibleFiles = scopePrefix
+    ? allFiles.filter(
+      (file) => file.path === scopePrefix || file.path.startsWith(`${scopePrefix}/`)
+    )
+    : allFiles;
 
-  for (const fileRef of mod.files) {
-    const fileDoc = data.files.find(
-      (file) => file.path === fileRef.path || file.path.endsWith(fileRef.path)
-    );
-    const id = `file:${fileRef.path}`;
-    if (seen.has(id)) continue;
-    seen.add(id);
+  const dirBuckets = bucketModuleFilesByNextDir(allFiles, scopePrefix, rootPrefix);
+  const directFiles = visibleFiles.filter((file) => {
+    let relative = normalizeTargetPath(file.path);
+    if (scopePrefix) {
+      relative = relative.slice(scopePrefix.length).replace(/^\/+/, "");
+    } else if (rootPrefix && (relative === rootPrefix || relative.startsWith(`${rootPrefix}/`))) {
+      relative = relative.slice(rootPrefix.length).replace(/^\/+/, "");
+    }
+    const parts = relative.split("/").filter(Boolean);
+    return parts.length <= 1;
+  });
+
+  if (dirBuckets.size > 0) {
+    const summaryId = `summary-module:${mod.name}:${scopePrefix || rootPrefix || "root"}`;
+    const preferredRootLabel = navLabel?.trim();
+    const baseLabel = !scopePrefix && preferredRootLabel
+      ? preferredRootLabel
+      : (mod.title || mod.name);
+    const summaryLabel = scopePrefix
+      ? `${baseLabel} / ${scopePrefix.split("/").pop() || scopePrefix}`
+      : baseLabel;
 
     nodes.push({
-      id,
-      type: "file",
+      id: summaryId,
+      type: "group",
       position: { x: 0, y: 0 },
       data: {
-        path: fileRef.path,
-        absPath: fileDoc?.abs_path || `${data.project_root}/${fileRef.path}`,
-        description: fileRef.description || fileDoc?.dive_file || "",
-        tagCount: fileDoc?.tags.length || 0,
+        name: summaryLabel,
+        count: visibleFiles.length,
+        children: visibleFiles.map((file) => file.path),
+        groupId: mod.name,
+        folderHints: [],
+        isSummary: true,
+        nonNavigable: true,
       },
     });
-  }
 
-  const modLower = normalizeName(mod.name);
-  for (const file of data.files) {
-    const id = `file:${file.path}`;
-    if (seen.has(id)) continue;
+    const orderedBuckets = [...dirBuckets.entries()].sort((a, b) => {
+      if (b[1].length !== a[1].length) return b[1].length - a[1].length;
+      return a[0].localeCompare(b[0]);
+    });
 
-    const pathNorm = normalizeName(file.path);
-    if (pathNorm.includes(modLower)) {
-      seen.add(id);
+    for (const [bucketPrefix, bucketFiles] of orderedBuckets) {
+      const filterId = makeModuleDirFilterId(mod.name, bucketPrefix);
+      const nodeId = `group:${filterId}`;
+      const label = bucketPrefix.split("/").pop() || bucketPrefix;
       nodes.push({
-        id,
+        id: nodeId,
+        type: "group",
+        position: { x: 0, y: 0 },
+        data: {
+          name: label,
+          count: bucketFiles.length,
+          children: bucketFiles.map((file) => file.path),
+          groupId: filterId,
+          folderHints: [],
+        },
+      });
+      addStructuralEdge(edges, summaryId, nodeId);
+    }
+
+    for (const file of directFiles) {
+      const fileId = `file:${file.path}`;
+      nodes.push({
+        id: fileId,
         type: "file",
         position: { x: 0, y: 0 },
         data: {
           path: file.path,
-          absPath: file.abs_path,
-          description: file.dive_file || `${file.tags.length} tags`,
-          tagCount: file.tags.length,
+          absPath: file.absPath,
+          description: file.description,
+          tagCount: file.tagCount,
+          hasDiveMeta: file.hasDiveMeta,
+        },
+      });
+      addStructuralEdge(edges, summaryId, fileId);
+    }
+  } else {
+    for (const file of visibleFiles) {
+      nodes.push({
+        id: `file:${file.path}`,
+        type: "file",
+        position: { x: 0, y: 0 },
+        data: {
+          path: file.path,
+          absPath: file.absPath,
+          description: file.description,
+          tagCount: file.tagCount,
+          hasDiveMeta: file.hasDiveMeta,
         },
       });
     }
@@ -2259,20 +2818,26 @@ function findNodesByRef(nodes: Node[], value: string): Node[] {
       path?: string;
       target?: string;
       name?: string;
+      children?: string[];
     };
-    const path = data.path || data.target || data.name || "";
-    if (!path) return false;
+    const candidates: string[] = [];
+    if (data.path) candidates.push(data.path);
+    if (data.target) candidates.push(data.target);
+    if (data.name) candidates.push(data.name);
+    if (Array.isArray(data.children)) candidates.push(...data.children);
+    if (candidates.length === 0) return false;
 
-    const fileName = path.split("/").pop() || "";
-    const fileBase = fileName.replace(/\.\w+$/, "");
-
-    return (
-      path === token ||
-      path.toLowerCase().includes(lower) ||
-      fileName.toLowerCase() === lower ||
-      fileBase.toLowerCase() === lower ||
-      normalizeName(path) === norm
-    );
+    return candidates.some((path) => {
+      const fileName = path.split("/").pop() || "";
+      const fileBase = fileName.replace(/\.\w+$/, "");
+      return (
+        path === token ||
+        path.toLowerCase().includes(lower) ||
+        fileName.toLowerCase() === lower ||
+        fileBase.toLowerCase() === lower ||
+        normalizeName(path) === norm
+      );
+    });
   });
 }
 
@@ -2288,6 +2853,7 @@ function addFileNode(nodes: Node[], file: FileDiveDoc) {
       absPath: file.abs_path,
       description: file.dive_file || `${file.tags.length} tags`,
       tagCount: file.tags.length,
+      hasDiveMeta: true,
     },
   });
 }
