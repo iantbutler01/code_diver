@@ -29,6 +29,7 @@ interface FileGroupData {
   parentTotalComponents?: number | null;
   isLeaf?: boolean;
   hasNameCollision?: boolean;
+  gitStatus?: "added" | "modified" | "deleted";
 }
 
 export function FileGroupNode({ data }: NodeProps) {
@@ -48,6 +49,7 @@ export function FileGroupNode({ data }: NodeProps) {
   const copyText = [
     `File Group: ${fileName}`,
     `Path: ${d.path}`,
+    d.gitStatus ? `Git status: ${d.gitStatus}` : null,
     d.collapsedCount ? `Collapsed components: ${d.collapsedCount}` : null,
     d.parentGroupId && d.parentTotalComponents
       ? `Coverage: ${d.collapsedCount} of ${d.parentTotalComponents} in ${d.parentGroupId}`
@@ -64,13 +66,18 @@ export function FileGroupNode({ data }: NodeProps) {
     .join("\n");
 
   return (
-    <div className="node node-file-group">
+    <div className={`node node-file-group ${d.gitStatus ? `node-git-${d.gitStatus}` : ""}`}>
       <Handle type="target" position={Position.Top} />
       <div className="node-header">
         <div className="node-title">{fileName}</div>
         <CopyButton text={copyText} />
       </div>
       <div className="node-path">{d.path}</div>
+      {d.gitStatus && (
+        <div className={`node-badge node-badge-git node-badge-git-${d.gitStatus}`}>
+          git: {d.gitStatus}
+        </div>
+      )}
       {d.hasNameCollision && (
         <div className="node-badge">name collision</div>
       )}
@@ -100,7 +107,7 @@ export function FileGroupNode({ data }: NodeProps) {
           ))}
         </div>
       )}
-      {!d.isSummary && d.tags && d.tags.length > 0 && (
+      {!d.isSummary && d.gitStatus !== "deleted" && d.tags && d.tags.length > 0 && (
         <div className="node-tags">
           {d.tags.map((t) => (
             <button
@@ -115,19 +122,26 @@ export function FileGroupNode({ data }: NodeProps) {
           ))}
         </div>
       )}
-      {!d.isSummary && d.isLeaf && d.tagCount > 0 && (
+      {!d.isSummary && d.gitStatus !== "deleted" && d.isLeaf && d.tagCount > 0 && (
         <div className="node-hint">
           click card to open file, or click a tag row for exact line
         </div>
       )}
-      {!d.isSummary && !d.isLeaf && d.tagCount > 0 && (
+      {!d.isSummary && d.gitStatus !== "deleted" && !d.isLeaf && d.tagCount > 0 && (
         <div className="node-hint">{d.tagCount} tags - click to explore</div>
       )}
       {!d.isSummary && d.tagCount === 0 && (
-        <div className="node-hint">click to open in VS Code</div>
+        <div className="node-hint">
+          {d.gitStatus === "deleted" ? "removed in working tree" : "click to open in VS Code"}
+        </div>
+      )}
+      {!d.isSummary && d.gitStatus === "deleted" && d.tagCount > 0 && (
+        <div className="node-hint">removed in working tree</div>
       )}
       {d.isSummary && (
-        <div className="node-hint">click to open in VS Code</div>
+        <div className="node-hint">
+          {d.gitStatus === "deleted" ? "removed in working tree" : "click to open in VS Code"}
+        </div>
       )}
       <Handle type="source" position={Position.Bottom} />
     </div>

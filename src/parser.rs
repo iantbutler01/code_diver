@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::Serialize;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use walkdir::{DirEntry, WalkDir};
 
 use crate::static_analysis::{
@@ -22,6 +24,43 @@ const IGNORED_DIRS: &[&str] = &[
     "build",
 ];
 
+const TEST_SEGMENTS: &[&str] = &[
+    "test",
+    "tests",
+    "__tests__",
+    "e2e",
+    "integration",
+    "unit",
+    "bench",
+    "benches",
+];
+const SPEC_SEGMENTS: &[&str] = &["spec", "specs"];
+const SCRIPT_SEGMENTS: &[&str] = &["script", "scripts", "bin", "tools", "tooling", "hack"];
+const DOC_SEGMENTS: &[&str] = &[
+    "doc",
+    "docs",
+    "example",
+    "examples",
+    "sample",
+    "samples",
+    "demo",
+    "demos",
+    "tutorial",
+    "tutorials",
+];
+const CONFIG_SEGMENTS: &[&str] = &[
+    "config",
+    "configs",
+    ".github",
+    "github",
+    "ci",
+    ".circleci",
+    ".gitlab",
+    "infra",
+    "deploy",
+    "deployment",
+];
+
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct GraphData {
     pub project_root: String,
@@ -30,7 +69,9 @@ pub struct GraphData {
     pub modules: Vec<ModuleDoc>,
     pub files: Vec<FileDiveDoc>,
     pub static_analysis: StaticAnalysis,
+    pub coverage: GraphCoverage,
     pub diagnostics: Vec<ParseDiagnostic>,
+    pub git_status: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,6 +133,24 @@ pub struct ParseDiagnostic {
     pub related: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GraphCoverage {
+    pub static_files: usize,
+    pub represented_files: usize,
+    pub missing_files: usize,
+    pub represented_pct: f32,
+    pub group_coverage: Vec<GroupCoverage>,
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct GroupCoverage {
+    pub group_id: String,
+    pub static_files: usize,
+    pub represented_files: usize,
+    pub missing_files: usize,
+    pub represented_pct: f32,
+}
+
 pub fn build_graph(project_root: &Path) -> Result<GraphData> {
     let (overview, mut diagnostics) = parse_overview(project_root)?;
     let (mut modules, mut module_diagnostics) = parse_modules(project_root)?;
@@ -99,7 +158,10 @@ pub fn build_graph(project_root: &Path) -> Result<GraphData> {
     modules.sort_by(|a, b| a.name.cmp(&b.name));
 
     let (mut files, static_analysis) = scan_source_files(project_root)?;
+    let git_status = collect_git_status(project_root);
+    merge_deleted_file_docs(project_root, &git_status, &mut files);
     files.sort_by(|a, b| a.path.cmp(&b.path));
+    let coverage = compute_graph_coverage(&overview, &modules, &files, &static_analysis);
 
     Ok(GraphData {
         project_root: normalize_path(project_root),
@@ -108,8 +170,260 @@ pub fn build_graph(project_root: &Path) -> Result<GraphData> {
         modules,
         files,
         static_analysis,
+        coverage,
         diagnostics,
+        git_status,
     })
+}
+
+fn compute_graph_coverage(
+    overview: &Option<OverviewDoc>,
+    modules: &[ModuleDoc],
+    files: &[FileDiveDoc],
+    static_analysis: &StaticAnalysis,
+) -> GraphCoverage {
+    let mut static_paths = static_analysis
+        .file_facts
+        .iter()
+        .map(|facts| normalize_path_token(&facts.path))
+        .filter(|path| !path.is_empty())
+        .collect::<Vec<_>>();
+    static_paths.sort();
+    static_paths.dedup();
+
+    if static_paths.is_empty() {
+        return GraphCoverage::default();
+    }
+
+    let mut represented = HashSet::<String>::new();
+    let static_lookup = static_paths.iter().cloned().collect::<HashSet<_>>();
+
+    for file in files {
+        let normalized = normalize_path_token(&file.path);
+        if static_lookup.contains(&normalized) {
+            represented.insert(normalized);
+        }
+    }
+
+    let mut tokens = Vec::<String>::new();
+
+    if let Some(ov) = overview {
+        for comp in &ov.components {
+            let Some(target) = comp.target.as_deref() else {
+                continue;
+            };
+            let cleaned = clean_markdown_target(target);
+            if cleaned.is_empty() || !is_likely_path_token(&cleaned) {
+                continue;
+            }
+            tokens.push(cleaned);
+        }
+    }
+
+    for module in modules {
+        for file in &module.files {
+            let normalized = normalize_path_token(&file.path);
+            if normalized.is_empty() {
+                continue;
+            }
+            tokens.push(normalized);
+        }
+    }
+
+    for token in tokens {
+        mark_represented_for_token(&token, &static_paths, &mut represented);
+    }
+
+    let static_files = static_paths.len();
+    let represented_files = represented.len();
+    let missing_files = static_files.saturating_sub(represented_files);
+    let represented_pct = pct(represented_files, static_files);
+
+    let mut static_by_group = HashMap::<String, usize>::new();
+    let mut represented_by_group = HashMap::<String, usize>::new();
+
+    for path in &static_paths {
+        let group = classify_group_id(path);
+        *static_by_group.entry(group.clone()).or_insert(0) += 1;
+        if represented.contains(path) {
+            *represented_by_group.entry(group).or_insert(0) += 1;
+        }
+    }
+
+    let mut group_ids = static_by_group.keys().cloned().collect::<Vec<_>>();
+    group_ids.sort();
+
+    let group_coverage = group_ids
+        .into_iter()
+        .map(|group_id| {
+            let static_count = static_by_group.get(&group_id).copied().unwrap_or(0);
+            let represented_count = represented_by_group.get(&group_id).copied().unwrap_or(0);
+            let missing_count = static_count.saturating_sub(represented_count);
+            GroupCoverage {
+                group_id,
+                static_files: static_count,
+                represented_files: represented_count,
+                missing_files: missing_count,
+                represented_pct: pct(represented_count, static_count),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    GraphCoverage {
+        static_files,
+        represented_files,
+        missing_files,
+        represented_pct,
+        group_coverage,
+    }
+}
+
+fn normalize_path_token(raw: &str) -> String {
+    raw.trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_start_matches('/')
+        .to_string()
+}
+
+fn clean_markdown_target(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let mut out = trimmed.to_string();
+
+    if let (Some(left_bracket), Some(right_paren)) = (trimmed.find("]("), trimmed.rfind(')')) {
+        if trimmed.starts_with('[') && left_bracket < right_paren {
+            out = trimmed[left_bracket + 2..right_paren].trim().to_string();
+        }
+    }
+
+    if out.starts_with('`') && out.ends_with('`') && out.len() > 1 {
+        out = out[1..out.len() - 1].trim().to_string();
+    }
+    if out.starts_with('<') && out.ends_with('>') && out.len() > 1 {
+        out = out[1..out.len() - 1].trim().to_string();
+    }
+
+    normalize_path_token(&out)
+}
+
+fn is_likely_path_token(raw: &str) -> bool {
+    if raw.is_empty() {
+        return false;
+    }
+    if raw.contains('/') {
+        return true;
+    }
+    let last = raw.rsplit('/').next().unwrap_or(raw);
+    last.contains('.')
+}
+
+fn mark_represented_for_token(
+    token: &str,
+    static_paths: &[String],
+    represented: &mut HashSet<String>,
+) {
+    let normalized = normalize_path_token(token);
+    if normalized.is_empty() {
+        return;
+    }
+
+    if normalized.contains('*') {
+        let prefix = normalize_path_token(
+            normalized
+                .split('*')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches('/'),
+        );
+        if prefix.is_empty() {
+            return;
+        }
+        for path in static_paths {
+            if path == &prefix || path.starts_with(&format!("{prefix}/")) {
+                represented.insert(path.clone());
+            }
+        }
+        return;
+    }
+
+    let as_dir = normalized.ends_with('/') || is_directory_like_token(&normalized);
+    if as_dir {
+        let prefix = normalized.trim_end_matches('/').to_string();
+        if prefix.is_empty() {
+            return;
+        }
+        for path in static_paths {
+            if path == &prefix || path.starts_with(&format!("{prefix}/")) {
+                represented.insert(path.clone());
+            }
+        }
+        return;
+    }
+
+    for path in static_paths {
+        if path == &normalized {
+            represented.insert(path.clone());
+        }
+    }
+}
+
+fn is_directory_like_token(token: &str) -> bool {
+    if token.ends_with('/') {
+        return true;
+    }
+    let last = token.rsplit('/').next().unwrap_or(token);
+    !last.contains('.')
+}
+
+fn classify_group_id(path: &str) -> String {
+    let segments = path
+        .split('/')
+        .map(|segment| segment.trim().to_ascii_lowercase())
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>();
+    if segments.is_empty() {
+        return "other".to_string();
+    }
+
+    if segments
+        .iter()
+        .any(|segment| TEST_SEGMENTS.contains(&segment.as_str()))
+    {
+        return "semantic:tests".to_string();
+    }
+    if segments
+        .iter()
+        .any(|segment| SPEC_SEGMENTS.contains(&segment.as_str()))
+    {
+        return "semantic:specs".to_string();
+    }
+    if segments
+        .iter()
+        .any(|segment| SCRIPT_SEGMENTS.contains(&segment.as_str()))
+    {
+        return "semantic:scripts".to_string();
+    }
+    if segments
+        .iter()
+        .any(|segment| DOC_SEGMENTS.contains(&segment.as_str()))
+    {
+        return "semantic:docs".to_string();
+    }
+    if segments
+        .iter()
+        .any(|segment| CONFIG_SEGMENTS.contains(&segment.as_str()))
+    {
+        return "semantic:config".to_string();
+    }
+
+    format!("path:{}", segments[0])
+}
+
+fn pct(numerator: usize, denominator: usize) -> f32 {
+    if denominator == 0 {
+        return 0.0;
+    }
+    ((numerator as f32 * 1000.0 / denominator as f32).round()) / 10.0
 }
 
 fn parse_overview(project_root: &Path) -> Result<(Option<OverviewDoc>, Vec<ParseDiagnostic>)> {
@@ -354,6 +668,168 @@ fn scan_source_files(project_root: &Path) -> Result<(Vec<FileDiveDoc>, StaticAna
     }
 
     Ok((files_with_tags, build_static_analysis(&static_inputs)))
+}
+
+fn merge_deleted_file_docs(
+    project_root: &Path,
+    git_status: &BTreeMap<String, String>,
+    files: &mut Vec<FileDiveDoc>,
+) {
+    let mut index_by_path = BTreeMap::<String, usize>::new();
+    for (idx, file) in files.iter().enumerate() {
+        index_by_path.insert(file.path.clone(), idx);
+    }
+
+    for (path, status) in git_status {
+        if status != "deleted" {
+            continue;
+        }
+        if let Some(parsed) = load_deleted_file_doc(project_root, path) {
+            if let Some(existing_idx) = index_by_path.get(&parsed.path).copied() {
+                files[existing_idx] = parsed;
+            } else {
+                index_by_path.insert(parsed.path.clone(), files.len());
+                files.push(parsed);
+            }
+        }
+    }
+}
+
+fn load_deleted_file_doc(project_root: &Path, rel_path: &str) -> Option<FileDiveDoc> {
+    if !is_supported_source_path(Path::new(rel_path)) {
+        return None;
+    }
+
+    let show_refs = [format!(":{rel_path}"), format!("HEAD:{rel_path}")];
+    let mut recovered_content: Option<String> = None;
+    for show_ref in show_refs {
+        let output = match Command::new("git")
+            .arg("-C")
+            .arg(project_root)
+            .arg("show")
+            .arg(&show_ref)
+            .output()
+        {
+            Ok(output) => output,
+            Err(_) => continue,
+        };
+
+        if !output.status.success() || output.stdout.is_empty() {
+            continue;
+        }
+
+        recovered_content = Some(String::from_utf8_lossy(&output.stdout).to_string());
+        break;
+    }
+
+    let content = recovered_content?;
+    let synthetic_path = project_root.join(rel_path);
+    let parsed = parse_file_content(&synthetic_path, &content, project_root);
+
+    if parsed.dive_file.is_none() && parsed.dive_rel.is_empty() && parsed.tags.is_empty() {
+        return None;
+    }
+
+    Some(parsed)
+}
+
+fn collect_git_status(project_root: &Path) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::<String, String>::new();
+
+    let output = match Command::new("git")
+        .arg("-C")
+        .arg(project_root)
+        .args(["status", "--porcelain=v1", "--untracked-files=normal"])
+        .output()
+    {
+        Ok(output) => output,
+        Err(_) => return out,
+    };
+
+    if !output.status.success() {
+        return out;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        let status = &line[..2];
+        if status == "!!" {
+            continue;
+        }
+        let raw_path = line[3..].trim();
+        if raw_path.is_empty() {
+            continue;
+        }
+
+        let parsed_path = parse_porcelain_path(raw_path);
+        if parsed_path.is_empty() {
+            continue;
+        }
+
+        let mapped_status = map_git_status(status);
+        if mapped_status.is_empty() {
+            continue;
+        }
+
+        upsert_git_status(&mut out, parsed_path, mapped_status.to_string());
+    }
+
+    out
+}
+
+fn parse_porcelain_path(raw: &str) -> String {
+    let path = if let Some(idx) = raw.rfind(" -> ") {
+        &raw[idx + 4..]
+    } else {
+        raw
+    };
+
+    let unquoted = path
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .replace('\\', "/");
+
+    unquoted.trim_start_matches("./").trim().to_string()
+}
+
+fn map_git_status(status: &str) -> &'static str {
+    if status == "??" {
+        return "added";
+    }
+
+    let mut chars = status.chars();
+    let staged = chars.next().unwrap_or(' ');
+    let unstaged = chars.next().unwrap_or(' ');
+    let code = if unstaged != ' ' { unstaged } else { staged };
+
+    match code {
+        'A' => "added",
+        'D' => "deleted",
+        'M' | 'R' | 'C' | 'T' | 'U' => "modified",
+        _ => "",
+    }
+}
+
+fn git_status_rank(value: &str) -> usize {
+    match value {
+        "deleted" => 3,
+        "added" => 2,
+        "modified" => 1,
+        _ => 0,
+    }
+}
+
+fn upsert_git_status(out: &mut BTreeMap<String, String>, path: String, status: String) {
+    match out.get(&path) {
+        Some(existing) if git_status_rank(existing) >= git_status_rank(&status) => {}
+        _ => {
+            out.insert(path, status);
+        }
+    }
 }
 
 fn parse_file_content(path: &Path, content: &str, project_root: &Path) -> FileDiveDoc {
@@ -698,7 +1174,20 @@ fn is_likely_source_file(path: &Path) -> bool {
         return true;
     }
 
+    is_supported_source_path(path)
+}
+
+fn is_supported_source_path(path: &Path) -> bool {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if matches!(file_name, "Dockerfile" | "Makefile" | "Justfile") {
+        return true;
+    }
+
     let extension = path.extension().and_then(|ext| ext.to_str()).unwrap_or("");
+
     matches!(
         extension,
         "rs" | "js"

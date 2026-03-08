@@ -130,8 +130,8 @@ impl StaticLanguage {
             Self::CFamily => &[".c", ".cc", ".cpp", ".h", ".hpp"],
             Self::Shell => &[".sh", ".bash", ".zsh"],
             Self::Other => &[
-                ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".kt", ".kts",
-                ".c", ".cc", ".cpp", ".h", ".hpp",
+                ".rs", ".ts", ".tsx", ".js", ".jsx", ".py", ".go", ".java", ".kt", ".kts", ".c",
+                ".cc", ".cpp", ".h", ".hpp",
             ],
         }
     }
@@ -309,121 +309,117 @@ fn collect_node_facts(
     let kind = node.kind();
 
     match language {
-        StaticLanguage::Rust => {
-            match kind {
-                "use_declaration" => {
-                    if let Ok(text) = node.utf8_text(source) {
-                        for token in extract_rust_use_tokens(text) {
-                            push_import_token(&token, imports);
-                        }
+        StaticLanguage::Rust => match kind {
+            "use_declaration" => {
+                if let Ok(text) = node.utf8_text(source) {
+                    for token in extract_rust_use_tokens(text) {
+                        push_import_token(&token, imports);
                     }
                 }
-                "mod_item" => {
-                    if let Some(name_node) = node.child_by_field_name("name") {
-                        if let Ok(name) = name_node.utf8_text(source) {
-                            push_import_token(name, imports);
-                        }
-                    }
-                }
-                "function_item" => {
-                    push_definition_from_field(node, source, "name", "function", definitions);
-                }
-                "struct_item" | "enum_item" | "trait_item" => {
-                    push_definition_from_field(node, source, "name", "type", definitions);
-                }
-                "call_expression" => {
-                    if let Some(name) = call_name_from_node(node, source) {
-                        *calls.entry(name).or_insert(0) += 1;
-                    }
-                }
-                "macro_invocation" => {
-                    if let Some(name_node) = node.child_by_field_name("macro") {
-                        if let Ok(text) = name_node.utf8_text(source) {
-                            if let Some(name) = extract_identifier_token(text) {
-                                *calls.entry(name).or_insert(0) += 1;
-                            }
-                        }
-                    }
-                }
-                _ => {}
             }
-        }
-        StaticLanguage::TypeScript | StaticLanguage::JavaScript => {
-            match kind {
-                "import_statement" => {
-                    if let Ok(text) = node.utf8_text(source) {
-                        for token in extract_quoted_tokens(text) {
-                            push_import_token(&token, imports);
+            "mod_item" => {
+                if let Some(name_node) = node.child_by_field_name("name") {
+                    if let Ok(name) = name_node.utf8_text(source) {
+                        push_import_token(name, imports);
+                    }
+                }
+            }
+            "function_item" => {
+                push_definition_from_field(node, source, "name", "function", definitions);
+            }
+            "struct_item" | "enum_item" | "trait_item" => {
+                push_definition_from_field(node, source, "name", "type", definitions);
+            }
+            "call_expression" => {
+                if let Some(name) = call_name_from_node(node, source) {
+                    *calls.entry(name).or_insert(0) += 1;
+                }
+            }
+            "macro_invocation" => {
+                if let Some(name_node) = node.child_by_field_name("macro") {
+                    if let Ok(text) = name_node.utf8_text(source) {
+                        if let Some(name) = extract_identifier_token(text) {
+                            *calls.entry(name).or_insert(0) += 1;
                         }
                     }
                 }
-                "function_declaration" => {
-                    push_definition_from_field(node, source, "name", "function", definitions);
-                }
-                "class_declaration" => {
-                    push_definition_from_field(node, source, "name", "type", definitions);
-                }
-                "method_definition" => {
-                    push_definition_from_field(node, source, "name", "method", definitions);
-                }
-                "variable_declarator" => {
-                    push_definition_from_field(node, source, "name", "value", definitions);
-                }
-                "call_expression" => {
-                    if let Some(name) = call_name_from_node(node, source) {
-                        *calls.entry(name).or_insert(0) += 1;
-                    }
-                }
-                _ => {}
             }
-        }
-        StaticLanguage::Python => {
-            match kind {
-                "import_statement" | "import_from_statement" => {
-                    if let Ok(text) = node.utf8_text(source) {
-                        for token in extract_python_import_tokens(text) {
-                            push_import_token(&token, imports);
-                        }
+            _ => {}
+        },
+        StaticLanguage::TypeScript | StaticLanguage::JavaScript => match kind {
+            "import_statement" => {
+                if let Ok(text) = node.utf8_text(source) {
+                    for token in extract_quoted_tokens(text) {
+                        push_import_token(&token, imports);
                     }
                 }
-                "function_definition" => {
-                    push_definition_from_field(node, source, "name", "function", definitions);
-                }
-                "class_definition" => {
-                    push_definition_from_field(node, source, "name", "type", definitions);
-                }
-                "call" => {
-                    if let Some(name) = call_name_from_node(node, source) {
-                        *calls.entry(name).or_insert(0) += 1;
-                    }
-                }
-                _ => {}
             }
-        }
-        StaticLanguage::Go => {
-            match kind {
-                "import_spec" => {
-                    if let Ok(text) = node.utf8_text(source) {
-                        for token in extract_quoted_tokens(text) {
-                            push_import_token(&token, imports);
-                        }
-                    }
-                }
-                "function_declaration" | "method_declaration" => {
-                    push_definition_from_field(node, source, "name", "function", definitions);
-                }
-                "type_spec" => {
-                    push_definition_from_field(node, source, "name", "type", definitions);
-                }
-                "call_expression" => {
-                    if let Some(name) = call_name_from_node(node, source) {
-                        *calls.entry(name).or_insert(0) += 1;
-                    }
-                }
-                _ => {}
+            "function_declaration" => {
+                push_definition_from_field(node, source, "name", "function", definitions);
             }
-        }
-        StaticLanguage::Java | StaticLanguage::Kotlin | StaticLanguage::CFamily | StaticLanguage::Shell | StaticLanguage::Other => {}
+            "class_declaration" => {
+                push_definition_from_field(node, source, "name", "type", definitions);
+            }
+            "method_definition" => {
+                push_definition_from_field(node, source, "name", "method", definitions);
+            }
+            "variable_declarator" => {
+                push_definition_from_field(node, source, "name", "value", definitions);
+            }
+            "call_expression" => {
+                if let Some(name) = call_name_from_node(node, source) {
+                    *calls.entry(name).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        },
+        StaticLanguage::Python => match kind {
+            "import_statement" | "import_from_statement" => {
+                if let Ok(text) = node.utf8_text(source) {
+                    for token in extract_python_import_tokens(text) {
+                        push_import_token(&token, imports);
+                    }
+                }
+            }
+            "function_definition" => {
+                push_definition_from_field(node, source, "name", "function", definitions);
+            }
+            "class_definition" => {
+                push_definition_from_field(node, source, "name", "type", definitions);
+            }
+            "call" => {
+                if let Some(name) = call_name_from_node(node, source) {
+                    *calls.entry(name).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        },
+        StaticLanguage::Go => match kind {
+            "import_spec" => {
+                if let Ok(text) = node.utf8_text(source) {
+                    for token in extract_quoted_tokens(text) {
+                        push_import_token(&token, imports);
+                    }
+                }
+            }
+            "function_declaration" | "method_declaration" => {
+                push_definition_from_field(node, source, "name", "function", definitions);
+            }
+            "type_spec" => {
+                push_definition_from_field(node, source, "name", "type", definitions);
+            }
+            "call_expression" => {
+                if let Some(name) = call_name_from_node(node, source) {
+                    *calls.entry(name).or_insert(0) += 1;
+                }
+            }
+            _ => {}
+        },
+        StaticLanguage::Java
+        | StaticLanguage::Kotlin
+        | StaticLanguage::CFamily
+        | StaticLanguage::Shell
+        | StaticLanguage::Other => {}
     }
 }
 
@@ -514,7 +510,11 @@ fn extract_identifier_token(raw: &str) -> Option<String> {
 fn extract_quoted_tokens(text: &str) -> Vec<String> {
     re_quoted()
         .captures_iter(text)
-        .filter_map(|caps| caps.get(1).or_else(|| caps.get(2)).map(|m| m.as_str().to_string()))
+        .filter_map(|caps| {
+            caps.get(1)
+                .or_else(|| caps.get(2))
+                .map(|m| m.as_str().to_string())
+        })
         .collect()
 }
 
@@ -578,7 +578,10 @@ fn build_import_index(files: &[FileStaticFactsInput]) -> ImportIndex {
         }
 
         let no_ext = strip_extension(&normalized);
-        by_no_ext.entry(no_ext).or_default().push(normalized.clone());
+        by_no_ext
+            .entry(no_ext)
+            .or_default()
+            .push(normalized.clone());
     }
 
     for paths in by_stem.values_mut() {
@@ -732,7 +735,13 @@ fn resolve_import_targets(
             .join("/");
         if !rust_mod.is_empty() {
             extend_path_candidates(&rust_mod, language, index, 0.84, &mut matches);
-            extend_path_candidates(&format!("src/{rust_mod}"), language, index, 0.8, &mut matches);
+            extend_path_candidates(
+                &format!("src/{rust_mod}"),
+                language,
+                index,
+                0.8,
+                &mut matches,
+            );
             return dedup_targets(matches);
         }
     }
@@ -787,7 +796,13 @@ fn extend_path_candidates(
         }
     }
 
-    for tail in ["/mod.rs", "/index.ts", "/index.tsx", "/index.js", "/__init__.py"] {
+    for tail in [
+        "/mod.rs",
+        "/index.ts",
+        "/index.tsx",
+        "/index.js",
+        "/__init__.py",
+    ] {
         let candidate = format!("{normalized}{tail}");
         if index.path_set.contains(&candidate) {
             out.push((candidate, confidence - 0.04));
@@ -848,7 +863,11 @@ fn compare_static_edges(a: &StaticEdge, b: &StaticEdge) -> Ordering {
         .partial_cmp(&score_a)
         .unwrap_or(Ordering::Equal)
         .then_with(|| b.weight.cmp(&a.weight))
-        .then_with(|| b.confidence.partial_cmp(&a.confidence).unwrap_or(Ordering::Equal))
+        .then_with(|| {
+            b.confidence
+                .partial_cmp(&a.confidence)
+                .unwrap_or(Ordering::Equal)
+        })
         .then_with(|| a.source_path.cmp(&b.source_path))
         .then_with(|| a.target_path.cmp(&b.target_path))
 }
@@ -869,7 +888,13 @@ fn parse_imports_for_line(language: StaticLanguage, line: &str, out: &mut Vec<St
                 }
             }
         }
-        StaticLanguage::Shell | StaticLanguage::Other | StaticLanguage::Rust | StaticLanguage::TypeScript | StaticLanguage::JavaScript | StaticLanguage::Python | StaticLanguage::Go => {}
+        StaticLanguage::Shell
+        | StaticLanguage::Other
+        | StaticLanguage::Rust
+        | StaticLanguage::TypeScript
+        | StaticLanguage::JavaScript
+        | StaticLanguage::Python
+        | StaticLanguage::Go => {}
     }
 }
 
@@ -888,7 +913,13 @@ fn parse_definitions_for_line(
             capture_definition(re_c_func(), line, line_number, "function", out);
             capture_definition(re_c_type(), line, line_number, "type", out);
         }
-        StaticLanguage::Shell | StaticLanguage::Other | StaticLanguage::Rust | StaticLanguage::TypeScript | StaticLanguage::JavaScript | StaticLanguage::Python | StaticLanguage::Go => {}
+        StaticLanguage::Shell
+        | StaticLanguage::Other
+        | StaticLanguage::Rust
+        | StaticLanguage::TypeScript
+        | StaticLanguage::JavaScript
+        | StaticLanguage::Python
+        | StaticLanguage::Go => {}
     }
 }
 
@@ -1009,7 +1040,10 @@ fn top_segment(path: &str) -> String {
 
 fn strip_extension(path: &str) -> String {
     let normalized = normalize_rel_path(path);
-    let last = normalized.rsplit_once('/').map(|(_, right)| right).unwrap_or(&normalized);
+    let last = normalized
+        .rsplit_once('/')
+        .map(|(_, right)| right)
+        .unwrap_or(&normalized);
     if let Some((base, ext)) = last.rsplit_once('.') {
         if !base.is_empty() && !ext.is_empty() {
             let prefix = normalized.strip_suffix(last).unwrap_or("");
@@ -1021,7 +1055,10 @@ fn strip_extension(path: &str) -> String {
 
 fn file_stem(path: &str) -> Option<String> {
     let normalized = normalize_rel_path(path);
-    let last = normalized.rsplit_once('/').map(|(_, right)| right).unwrap_or(&normalized);
+    let last = normalized
+        .rsplit_once('/')
+        .map(|(_, right)| right)
+        .unwrap_or(&normalized);
     if last.is_empty() {
         return None;
     }
@@ -1063,8 +1100,7 @@ fn is_comment_line(line: &str, language: StaticLanguage) -> bool {
 fn is_call_keyword(token: &str) -> bool {
     matches!(
         token,
-        "if"
-            | "else"
+        "if" | "else"
             | "for"
             | "while"
             | "loop"
@@ -1138,10 +1174,8 @@ fn re_java_type() -> &'static Regex {
 fn re_c_func() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(
-            r"^\s*[A-Za-z_][A-Za-z0-9_\s\*]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*\{",
-        )
-        .expect("valid regex")
+        Regex::new(r"^\s*[A-Za-z_][A-Za-z0-9_\s\*]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^;]*\)\s*\{")
+            .expect("valid regex")
     })
 }
 

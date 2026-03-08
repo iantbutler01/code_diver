@@ -10,6 +10,7 @@ interface GroupData {
   isSummary?: boolean;
   nonNavigable?: boolean;
   hasNameCollision?: boolean;
+  gitStatus?: "added" | "modified" | "deleted";
   relIn?: number;
   relOut?: number;
   relTotal?: number;
@@ -30,6 +31,7 @@ export function GroupNode({ data }: NodeProps) {
   const copyText = [
     `Group: ${title}`,
     `Components: ${d.count}`,
+    d.gitStatus ? `Git status: ${d.gitStatus}` : null,
     d.folderHints?.length ? `Folder hints: ${d.folderHints.join(", ")}` : null,
     typeof d.relIn === "number" ? `Xrefs in: ${d.relIn}` : null,
     typeof d.relOut === "number" ? `Xrefs out: ${d.relOut}` : null,
@@ -41,12 +43,17 @@ export function GroupNode({ data }: NodeProps) {
     .join("\n");
 
   return (
-    <div className={`node node-group ${d.isSummary ? "node-group-summary" : ""} ${d.nonNavigable ? "node-group-anchor" : ""}`}>
+    <div className={`node node-group ${d.isSummary ? "node-group-summary" : ""} ${d.nonNavigable ? "node-group-anchor" : ""} ${d.gitStatus ? `node-git-${d.gitStatus}` : ""}`}>
       <Handle type="target" position={Position.Top} />
       <div className="node-header">
         <div className="node-group-title">{title}</div>
         <CopyButton text={copyText} />
       </div>
+      {d.gitStatus && (
+        <div className={`node-badge node-badge-git node-badge-git-${d.gitStatus}`}>
+          git: {d.gitStatus}
+        </div>
+      )}
       <div className="node-group-count">{d.count} components</div>
       {typeof d.relIn === "number" && typeof d.relOut === "number" && (
         <div className="node-xrefs">

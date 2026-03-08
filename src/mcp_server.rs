@@ -1,4 +1,6 @@
-use crate::parser::{ComponentEntry, FileDiveDoc, GraphData, ModuleDoc, ParseDiagnostic};
+use crate::parser::{
+    ComponentEntry, FileDiveDoc, GraphData, GroupCoverage, ModuleDoc, ParseDiagnostic,
+};
 use reson_mcp::server::{McpServer, ServerTransport};
 use reson_mcp::{CallToolResult, Content};
 use serde_json::{Map, Value, json};
@@ -126,6 +128,7 @@ fn build_server(project_root: PathBuf, graph: Arc<RwLock<GraphData>>) -> McpServ
                             "files": graph.files.len(),
                             "diagnostics": graph.diagnostics.len()
                         },
+                        "coverage": graph_coverage_json(&graph),
                         "groups": groups
                     })))
                 })
@@ -179,10 +182,26 @@ fn build_server(project_root: PathBuf, graph: Arc<RwLock<GraphData>>) -> McpServ
                         })
                         .take(max_relationships)
                         .collect();
+                    let group_coverage = graph
+                        .coverage
+                        .group_coverage
+                        .iter()
+                        .find(|item| item.group_id == group_id)
+                        .map(group_coverage_json)
+                        .unwrap_or_else(|| {
+                            json!({
+                                "group_id": group_id,
+                                "static_files": 0,
+                                "represented_files": 0,
+                                "missing_files": 0,
+                                "represented_pct": 0.0
+                            })
+                        });
 
                     Ok(CallToolResult::structured(json!({
                         "group_id": group_id,
                         "group_label": group_label_from_id(&group_id),
+                        "coverage": group_coverage,
                         "component_count": matched_components.len(),
                         "components": matched_components
                             .iter()
@@ -242,6 +261,7 @@ fn build_server(project_root: PathBuf, graph: Arc<RwLock<GraphData>>) -> McpServ
                             "path": module.path,
                             "description": module.description,
                         },
+                        "coverage": graph_coverage_json(&graph),
                         "file_count": module.files.len(),
                         "files": module.files.iter().take(max_files).map(|file| json!({
                             "path": file.path,
@@ -532,6 +552,26 @@ fn get_usize_arg(
         _ => None,
     });
     value.unwrap_or(default).clamp(min, max)
+}
+
+fn graph_coverage_json(graph: &GraphData) -> Value {
+    json!({
+        "static_files": graph.coverage.static_files,
+        "represented_files": graph.coverage.represented_files,
+        "missing_files": graph.coverage.missing_files,
+        "represented_pct": graph.coverage.represented_pct,
+        "group_count": graph.coverage.group_coverage.len()
+    })
+}
+
+fn group_coverage_json(group: &GroupCoverage) -> Value {
+    json!({
+        "group_id": group.group_id,
+        "static_files": group.static_files,
+        "represented_files": group.represented_files,
+        "missing_files": group.missing_files,
+        "represented_pct": group.represented_pct
+    })
 }
 
 fn normalize_name(value: &str) -> String {

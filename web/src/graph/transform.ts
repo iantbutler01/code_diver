@@ -1,6 +1,7 @@
 import type { Node, Edge } from "@xyflow/react";
 import type {
   GraphData,
+  GitDiffStatus,
   NavEntry,
   ModuleDoc,
   FileDiveDoc,
@@ -102,6 +103,14 @@ interface RelationCandidate {
   hasSemantic: boolean;
   hasStatic: boolean;
   reasons: string[];
+}
+
+export interface GraphScopeCoverage {
+  staticFiles: number;
+  representedFiles: number;
+  missingFiles: number;
+  representedPct: number;
+  missingSample: string[];
 }
 
 const TEST_SEGMENTS = new Set([
@@ -218,6 +227,64 @@ function getPathSegments(target: string): string[] {
     .split("/")
     .map((segment) => segment.trim().toLowerCase())
     .filter(Boolean);
+}
+
+function gitStatusRank(status: GitDiffStatus | null | undefined): number {
+  if (status === "deleted") return 3;
+  if (status === "added") return 2;
+  if (status === "modified") return 1;
+  return 0;
+}
+
+function mergeGitStatus(
+  current: GitDiffStatus | undefined,
+  next: GitDiffStatus | undefined
+): GitDiffStatus | undefined {
+  if (!next) return current;
+  if (!current) return next;
+  return gitStatusRank(next) > gitStatusRank(current) ? next : current;
+}
+
+function isDirectoryLikePath(path: string): boolean {
+  if (!path) return false;
+  if (path.endsWith("/")) return true;
+  const last = path.split("/").pop() || "";
+  return !last.includes(".");
+}
+
+function gitStatusForPath(
+  gitStatus: Record<string, GitDiffStatus> | undefined,
+  path: string | null | undefined
+): GitDiffStatus | undefined {
+  if (!gitStatus || !path) return undefined;
+  const normalized = normalizeTargetPath(path);
+  if (!normalized) return undefined;
+
+  const exact = gitStatus[normalized];
+  if (exact) return exact;
+
+  if (!isDirectoryLikePath(normalized)) {
+    return undefined;
+  }
+
+  const prefix = `${normalized.replace(/\/+$/, "")}/`;
+  let merged: GitDiffStatus | undefined;
+  for (const [changedPath, status] of Object.entries(gitStatus)) {
+    if (!changedPath.startsWith(prefix)) continue;
+    merged = mergeGitStatus(merged, status);
+  }
+  return merged;
+}
+
+function gitStatusForTargets(
+  gitStatus: Record<string, GitDiffStatus> | undefined,
+  targets: Array<string | null | undefined>
+): GitDiffStatus | undefined {
+  let merged: GitDiffStatus | undefined;
+  for (const target of targets) {
+    merged = mergeGitStatus(merged, gitStatusForPath(gitStatus, target));
+  }
+  return merged;
 }
 
 function hasAnySegment(
@@ -378,6 +445,248 @@ function parseModuleDirFilterId(
     return { moduleId, dirPrefix };
   } catch {
     return null;
+  }
+}
+
+interface PathPattern {
+  kind: "exact" | "prefix";
+  value: string;
+}
+
+function isLikelyPathToken(value: string | null | undefined): boolean {
+  if (!value) return false;
+  const normalized = normalizeTargetPath(value);
+  if (!normalized) return false;
+  if (normalized.includes("/")) return true;
+  const last = normalized.split("/").pop() || normalized;
+  return /\.[a-z0-9]{1,8}$/i.test(last);
+}
+
+function toPathPattern(rawToken: string): PathPattern | null {
+  const normalized = normalizeTargetPath(rawToken);
+  if (!normalized) return null;
+
+  if (normalized.includes("*")) {
+    const prefix = normalizeTargetPath(normalized.split("*")[0] || "");
+    if (!prefix) return null;
+    return { kind: "prefix", value: prefix.replace(/\/+$/, "") };
+  }
+
+  if (isDirectoryLikePath(normalized)) {
+    return {
+      kind: "prefix",
+      value: normalized.replace(/\/+$/, ""),
+    };
+  }
+
+  return {
+    kind: "exact",
+    value: normalized,
+  };
+}
+
+function pathMatchesPattern(path: string, pattern: PathPattern): boolean {
+  if (!pattern.value) return false;
+  if (pattern.kind === "exact") return path === pattern.value;
+  return path === pattern.value || path.startsWith(`${pattern.value}/`);
+}
+
+function staticPaths(data: GraphData): string[] {
+  const dedup = new Set<string>();
+  for (const facts of data.static_analysis?.file_facts || []) {
+    const path = normalizeTargetPath(facts.path);
+    if (path) dedup.add(path);
+  }
+  return [...dedup].sort((a, b) => a.localeCompare(b));
+}
+
+function representedPathSet(data: GraphData, staticList: string[]): Set<string> {
+  const represented = new Set<string>();
+  const exact = new Set<string>();
+  const patterns: PathPattern[] = [];
+
+  for (const file of data.files || []) {
+    const path = normalizeTargetPath(file.path);
+    if (path) {
+      exact.add(path);
+      patterns.push({ kind: "exact", value: path });
+    }
+  }
+
+  for (const mod of data.modules || []) {
+    for (const file of mod.files || []) {
+      const token = normalizeTargetPath(file.path);
+      if (!token) continue;
+      const pattern = toPathPattern(token);
+      if (pattern) patterns.push(pattern);
+    }
+  }
+
+  const overview = data.overview;
+  if (overview) {
+    for (const comp of overview.components || []) {
+      const target = cleanTarget(comp.target);
+      if (!isLikelyPathToken(target)) continue;
+      const pattern = toPathPattern(target!);
+      if (pattern) patterns.push(pattern);
+    }
+  }
+
+  for (const path of staticList) {
+    if (exact.has(path)) {
+      represented.add(path);
+      continue;
+    }
+    if (patterns.some((pattern) => pathMatchesPattern(path, pattern))) {
+      represented.add(path);
+    }
+  }
+
+  return represented;
+}
+
+function modulePathPatterns(data: GraphData, moduleId: string): PathPattern[] {
+  const patterns: PathPattern[] = [];
+  const mod = findModule(data, moduleId);
+  if (mod) {
+    for (const file of mod.files || []) {
+      const pattern = toPathPattern(file.path);
+      if (pattern) patterns.push(pattern);
+    }
+    const basePattern = toPathPattern(`${mod.name}/`);
+    if (basePattern) patterns.push(basePattern);
+    return patterns;
+  }
+
+  const fallback = toPathPattern(`${moduleId}/`);
+  if (fallback) patterns.push(fallback);
+  return patterns;
+}
+
+function pathInScope(path: string, data: GraphData, nav: NavEntry): boolean {
+  if (nav.level === "file") {
+    const target = normalizeTargetPath(nav.id || "");
+    return !!target && path === target;
+  }
+
+  if (nav.level === "module") {
+    const rawId = nav.id || "";
+    const parsedDir = parseModuleDirFilterId(rawId);
+    if (parsedDir) {
+      const scopePrefix = normalizeTargetPath(parsedDir.dirPrefix);
+      return path === scopePrefix || path.startsWith(`${scopePrefix}/`);
+    }
+
+    const patterns = modulePathPatterns(data, rawId);
+    if (patterns.length === 0) return true;
+    return patterns.some((pattern) => pathMatchesPattern(path, pattern));
+  }
+
+  if (nav.level === "system") {
+    const rawGroup = (nav.id || "").trim();
+    if (!rawGroup || rawGroup === "__all__") {
+      return true;
+    }
+
+    const moduleFilter = parseModuleClusterFilterId(rawGroup);
+    const baseGroupId = moduleFilter?.baseGroupId || rawGroup;
+    let inBaseGroup = true;
+    if (baseGroupId && baseGroupId !== "__all__") {
+      inBaseGroup = classifyComponentGroup(path).id === baseGroupId;
+      if (!inBaseGroup && !baseGroupId.includes(":")) {
+        inBaseGroup = path === baseGroupId || path.startsWith(`${baseGroupId}/`);
+      }
+    }
+    if (!inBaseGroup) return false;
+
+    if (!moduleFilter || moduleFilter.moduleBucketId === "__unmapped__") {
+      return true;
+    }
+
+    const modulePatterns = modulePathPatterns(data, moduleFilter.moduleBucketId);
+    if (modulePatterns.length === 0) return true;
+    return modulePatterns.some((pattern) => pathMatchesPattern(path, pattern));
+  }
+
+  return true;
+}
+
+function pct(represented: number, total: number): number {
+  if (total <= 0) return 0;
+  return Math.round((represented / total) * 1000) / 10;
+}
+
+export function graphScopeCoverage(data: GraphData, nav: NavEntry): GraphScopeCoverage {
+  const staticList = staticPaths(data);
+  if (staticList.length === 0) {
+    return {
+      staticFiles: 0,
+      representedFiles: 0,
+      missingFiles: 0,
+      representedPct: 0,
+      missingSample: [],
+    };
+  }
+
+  const represented = representedPathSet(data, staticList);
+  let staticFiles = 0;
+  let representedFiles = 0;
+  const missingSample: string[] = [];
+
+  for (const path of staticList) {
+    if (!pathInScope(path, data, nav)) continue;
+    staticFiles += 1;
+    if (represented.has(path)) {
+      representedFiles += 1;
+    } else if (missingSample.length < 5) {
+      missingSample.push(path);
+    }
+  }
+
+  const missingFiles = Math.max(0, staticFiles - representedFiles);
+  return {
+    staticFiles,
+    representedFiles,
+    missingFiles,
+    representedPct: pct(representedFiles, staticFiles),
+    missingSample,
+  };
+}
+
+function attachUnannotatedBucket(
+  nodes: Node[],
+  edges: Edge[],
+  coverage: GraphScopeCoverage,
+  nav: NavEntry
+) {
+  if (coverage.missingFiles <= 0 || nav.level === "file") return;
+
+  const scopeId = `${nav.level}:${nav.id || "__root__"}`;
+  const nodeId = `group:coverage:unannotated:${scopeId}`;
+  if (nodes.some((node) => node.id === nodeId)) return;
+
+  nodes.push({
+    id: nodeId,
+    type: "group",
+    position: { x: 0, y: 0 },
+    data: {
+      name: "Unannotated files",
+      count: coverage.missingFiles,
+      children: coverage.missingSample,
+      groupId: "__coverage_unannotated__",
+      folderHints: [`coverage ${coverage.representedFiles}/${coverage.staticFiles} represented`],
+      nonNavigable: true,
+    },
+  });
+
+  const anchor =
+    nodes.find((node) => {
+      const d = node.data as { isSummary?: boolean };
+      return node.id !== nodeId && d?.isSummary;
+    }) || nodes.find((node) => node.id !== nodeId);
+
+  if (anchor) {
+    addStructuralEdge(edges, anchor.id, nodeId);
   }
 }
 
@@ -1747,6 +2056,9 @@ export function transformGraph(
   else if (nav.level === "file") result = fileLevel(data, nav.id!);
   else result = { nodes: [], edges: [] };
 
+  const coverage = graphScopeCoverage(data, nav);
+  attachUnannotatedBucket(result.nodes, result.edges, coverage, nav);
+
   if (result.nodes.length > 0) {
     const withStatic = addStaticRelationships(data, nav, result.nodes, result.edges);
     const withCollapsedParallels = collapseParallelRelationEdges(withStatic);
@@ -1801,10 +2113,11 @@ function aggregatedSystemLevel(
   data: GraphData,
   ov: OverviewDoc
 ): { nodes: Node[]; edges: Edge[] } {
+  const gitStatus = data.git_status || {};
   const components = prepareComponents(ov.components);
   const moduleBuckets = buildModuleBuckets(data, components);
   if (shouldUseModuleClusters(components, moduleBuckets)) {
-    return moduleClusterSystemLevel(ov, "__all__", "system", components, moduleBuckets);
+    return moduleClusterSystemLevel(data, ov, "__all__", "system", components, moduleBuckets);
   }
 
   const nodes: Node[] = [];
@@ -1830,6 +2143,7 @@ function aggregatedSystemLevel(
         children: comps.map((c) => c.name),
         groupId,
         folderHints: deriveFolderHints(comps, groupId),
+        gitStatus: gitStatusForTargets(gitStatus, comps.map((c) => c.target)),
       },
     });
   }
@@ -1923,7 +2237,7 @@ function filteredSystemLevel(
 
   const moduleBuckets = buildModuleBuckets(data, allComponents);
   if (shouldUseModuleClusters(allComponents, moduleBuckets)) {
-    return moduleClusterSystemLevel(ov, baseGroupId, baseLabel, allComponents, moduleBuckets);
+    return moduleClusterSystemLevel(data, ov, baseGroupId, baseLabel, allComponents, moduleBuckets);
   }
 
   return buildComponentNodes(data, ov, allComponents, {
@@ -1939,12 +2253,14 @@ function filteredSystemLevel(
 }
 
 function moduleClusterSystemLevel(
+  data: GraphData,
   ov: OverviewDoc,
   baseGroupId: string,
   baseLabel: string,
   allComponents: ComponentRecord[],
   moduleBuckets: Map<string, ModuleComponentBucket>
 ): { nodes: Node[]; edges: Edge[] } {
+  const gitStatus = data.git_status || {};
   const nodes: Node[] = [];
   const edges: Edge[] = [];
 
@@ -1959,6 +2275,7 @@ function moduleClusterSystemLevel(
       children: allComponents.map((c) => c.name),
       groupId: baseGroupId,
       folderHints: deriveFolderHints(allComponents, baseGroupId),
+      gitStatus: gitStatusForTargets(gitStatus, allComponents.map((c) => c.target)),
       isSummary: true,
       nonNavigable: true,
     },
@@ -1988,6 +2305,7 @@ function moduleClusterSystemLevel(
         groupId: filterId,
         moduleId: bucket.id === "__unmapped__" ? null : bucket.id,
         folderHints: deriveFolderHints(bucket.comps, baseGroupId),
+        gitStatus: gitStatusForTargets(gitStatus, bucket.comps.map((c) => c.target)),
       },
     });
     addStructuralEdge(edges, summaryNodeId, nodeId);
@@ -2044,6 +2362,7 @@ function buildComponentNodes(
   components: ComponentRecord[],
   options: BuildOptions = {}
 ): { nodes: Node[]; edges: Edge[] } {
+  const gitStatus = data.git_status || {};
   const nodes: Node[] = [];
   const edges: Edge[] = [];
   const duplicateNames = duplicateNameSet(components);
@@ -2061,6 +2380,7 @@ function buildComponentNodes(
         children: options.parentSummary.componentNames,
         groupId: options.parentSummary.groupId,
         folderHints: options.parentSummary.folderHints,
+        gitStatus: gitStatusForTargets(gitStatus, components.map((c) => c.target)),
         isSummary: true,
         nonNavigable: true,
       },
@@ -2103,6 +2423,11 @@ function buildComponentNodes(
         moduleId: resolvedModule?.name || null,
         folderHints: deriveFolderHints([parent, ...children], dirPath),
         hasNameCollision: duplicateNames.has(parent.normName),
+        gitStatus: gitStatusForTargets(gitStatus, [
+          dirPath,
+          parent.target,
+          ...children.map((c) => c.target),
+        ]),
       },
     });
 
@@ -2144,6 +2469,7 @@ function buildComponentNodes(
           moduleId: resolvedModule?.name || null,
           hasChildren: !!(resolvedModule || matchingFiles.length > 0),
           hasNameCollision: duplicateNames.has(comp.normName),
+          gitStatus: gitStatusForPath(gitStatus, comp.target),
         },
       });
 
@@ -2185,6 +2511,10 @@ function buildComponentNodes(
         parentTotalComponents: options.parentSummary?.totalComponents || null,
         isLeaf: !!options.fileGroupsAreLeaf,
         hasNameCollision: comps.some((c) => duplicateNames.has(c.normName)),
+        gitStatus: gitStatusForTargets(gitStatus, [
+          target,
+          ...comps.map((c) => c.target),
+        ]),
       },
     });
 
@@ -2271,6 +2601,7 @@ function isLikelyDirectory(path: string): boolean {
 }
 
 function flatSystemLevel(data: GraphData): { nodes: Node[]; edges: Edge[] } {
+  const gitStatus = data.git_status || {};
   const ov = data.overview;
 
   if (ov && ov.components.length > 0) {
@@ -2292,6 +2623,7 @@ function flatSystemLevel(data: GraphData): { nodes: Node[]; edges: Edge[] } {
           target: null,
           moduleId: mod.name,
           hasChildren: true,
+          gitStatus: gitStatusForPath(gitStatus, mod.name),
         },
       });
     }
@@ -2311,12 +2643,13 @@ function flatSystemLevel(data: GraphData): { nodes: Node[]; edges: Edge[] } {
             moduleId: null,
             dirPath: dir,
             hasChildren: true,
+            gitStatus: gitStatusForPath(gitStatus, dir),
           },
         });
       }
     } else {
       for (const file of data.files) {
-        addFileNode(nodes, file);
+        addFileNode(nodes, file, gitStatus);
       }
       addDiveRelEdges(data, nodes, edges);
     }
@@ -2333,6 +2666,7 @@ interface ModuleFileRecord {
   description: string;
   tagCount: number;
   hasDiveMeta: boolean;
+  gitStatus?: GitDiffStatus;
 }
 
 function moduleRootPrefix(paths: string[]): string {
@@ -2363,6 +2697,7 @@ function moduleRootPrefix(paths: string[]): string {
 }
 
 function collectModuleFiles(data: GraphData, mod: ModuleDoc): ModuleFileRecord[] {
+  const gitStatus = data.git_status || {};
   const files = new Map<string, ModuleFileRecord>();
   const declaredPaths = mod.files
     .map((entry) => normalizeTargetPath(entry.path).replace(/\/\*.*$/, ""))
@@ -2382,6 +2717,7 @@ function collectModuleFiles(data: GraphData, mod: ModuleDoc): ModuleFileRecord[]
       description: description || fileDoc?.dive_file || "",
       tagCount: fileDoc?.tags.length || 0,
       hasDiveMeta: hasDiveMetaFromFile || hasDiveMetaFromModuleDoc,
+      gitStatus: gitStatusForPath(gitStatus, normalized),
     });
   };
 
@@ -2475,6 +2811,7 @@ function moduleLevel(
   moduleId: string,
   navLabel?: string
 ): { nodes: Node[]; edges: Edge[] } {
+  const gitStatus = data.git_status || {};
   const nodes: Node[] = [];
   const edges: Edge[] = [];
 
@@ -2494,7 +2831,7 @@ function moduleLevel(
 
   if (dirFiles.length > 0) {
     for (const file of dirFiles) {
-      addFileNode(nodes, file);
+      addFileNode(nodes, file, gitStatus);
     }
     addDiveRelEdges(data, nodes, edges);
     return { nodes, edges };
@@ -2509,7 +2846,7 @@ function moduleLevel(
     const files = findComponentFiles(data, comp.name, comp.target);
     if (files.length > 0) {
       for (const file of files) {
-        addFileNode(nodes, file);
+        addFileNode(nodes, file, gitStatus);
       }
       addDiveRelEdges(data, nodes, edges);
       return { nodes, edges };
@@ -2532,6 +2869,7 @@ function moduleLevel(
           description: comp.description || "No dive tags in this file yet",
           tagCount: 0,
           hasDiveMeta: !!comp.description,
+          gitStatus: gitStatusForPath(gitStatus, comp.target),
         },
       });
       return { nodes, edges };
@@ -2542,7 +2880,7 @@ function moduleLevel(
   for (const file of data.files) {
     const pathNorm = normalizeName(file.path);
     if (pathNorm.includes(lower)) {
-      addFileNode(nodes, file);
+      addFileNode(nodes, file, gitStatus);
     }
   }
   addDiveRelEdges(data, nodes, edges);
@@ -2558,6 +2896,7 @@ function buildModuleNodes(
   scopePrefix: string | null,
   navLabel?: string
 ) {
+  const gitStatus = data.git_status || {};
   const allFiles = collectModuleFiles(data, mod);
   const rootPrefix = moduleRootPrefix(mod.files.map((entry) => entry.path));
   const visibleFiles = scopePrefix
@@ -2598,6 +2937,10 @@ function buildModuleNodes(
         children: visibleFiles.map((file) => file.path),
         groupId: mod.name,
         folderHints: [],
+        gitStatus: gitStatusForTargets(
+          gitStatus,
+          visibleFiles.map((file) => file.path)
+        ),
         isSummary: true,
         nonNavigable: true,
       },
@@ -2622,6 +2965,10 @@ function buildModuleNodes(
           children: bucketFiles.map((file) => file.path),
           groupId: filterId,
           folderHints: [],
+          gitStatus: gitStatusForTargets(
+            gitStatus,
+            bucketFiles.map((file) => file.path)
+          ),
         },
       });
       addStructuralEdge(edges, summaryId, nodeId);
@@ -2639,6 +2986,7 @@ function buildModuleNodes(
           description: file.description,
           tagCount: file.tagCount,
           hasDiveMeta: file.hasDiveMeta,
+          gitStatus: file.gitStatus,
         },
       });
       addStructuralEdge(edges, summaryId, fileId);
@@ -2655,6 +3003,7 @@ function buildModuleNodes(
           description: file.description,
           tagCount: file.tagCount,
           hasDiveMeta: file.hasDiveMeta,
+          gitStatus: file.gitStatus,
         },
       });
     }
@@ -2693,6 +3042,7 @@ function fileLevel(
   data: GraphData,
   filePath: string
 ): { nodes: Node[]; edges: Edge[] } {
+  const gitStatus = data.git_status || {};
   const nodes: Node[] = [];
   const edges: Edge[] = [];
 
@@ -2716,6 +3066,7 @@ function fileLevel(
         diveRels: file.dive_rel,
         tags: [],
         tagCount: file.tags.length,
+        gitStatus: gitStatusForPath(gitStatus, file.path),
         isSummary: true,
       },
     });
@@ -2734,6 +3085,7 @@ function fileLevel(
       tagCount: file.tags.length,
       isHeader: true,
       diveRels: file.dive_rel,
+      gitStatus: gitStatusForPath(gitStatus, file.path),
     },
   });
 
@@ -2772,6 +3124,7 @@ function fileLevel(
         description: refFile?.dive_file || rel,
         tagCount: refFile?.tags.length || 0,
         isReference: true,
+        gitStatus: gitStatusForPath(gitStatus, refPath),
       },
     });
 
@@ -2916,7 +3269,11 @@ function findNodesByRef(nodes: Node[], value: string): Node[] {
   });
 }
 
-function addFileNode(nodes: Node[], file: FileDiveDoc) {
+function addFileNode(
+  nodes: Node[],
+  file: FileDiveDoc,
+  gitStatus?: Record<string, GitDiffStatus>
+) {
   const id = `file:${file.path}`;
   if (nodes.some((node) => node.id === id)) return;
   nodes.push({
@@ -2929,6 +3286,7 @@ function addFileNode(nodes: Node[], file: FileDiveDoc) {
       description: file.dive_file || `${file.tags.length} tags`,
       tagCount: file.tags.length,
       hasDiveMeta: true,
+      gitStatus: gitStatusForPath(gitStatus, file.path),
     },
   });
 }

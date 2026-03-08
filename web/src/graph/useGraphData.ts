@@ -11,7 +11,15 @@ function normalizeGraph(raw: GraphData): GraphData {
       edges: [],
       truncated: false,
     },
+    coverage: raw.coverage || {
+      static_files: 0,
+      represented_files: 0,
+      missing_files: 0,
+      represented_pct: 0,
+      group_coverage: [],
+    },
     diagnostics: raw.diagnostics || [],
+    git_status: raw.git_status || {},
   };
 }
 

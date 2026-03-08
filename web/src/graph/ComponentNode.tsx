@@ -8,6 +8,7 @@ interface ComponentData {
   target: string | null;
   hasChildren: boolean;
   hasNameCollision?: boolean;
+  gitStatus?: "added" | "modified" | "deleted";
   relIn?: number;
   relOut?: number;
   relTotal?: number;
@@ -27,6 +28,7 @@ export function ComponentNode({ data }: NodeProps) {
   const copyText = [
     `Component: ${d.name}`,
     d.target ? `Target: ${d.target}` : null,
+    d.gitStatus ? `Git status: ${d.gitStatus}` : null,
     d.description ? `Description: ${d.description}` : null,
     d.hasChildren ? "Has children: true" : "Has children: false",
     typeof d.relIn === "number" ? `Xrefs in: ${d.relIn}` : null,
@@ -37,12 +39,17 @@ export function ComponentNode({ data }: NodeProps) {
     .join("\n");
 
   return (
-    <div className="node node-component">
+    <div className={`node node-component ${d.gitStatus ? `node-git-${d.gitStatus}` : ""}`}>
       <Handle type="target" position={Position.Top} />
       <div className="node-header">
         <div className="node-title">{d.name}</div>
         <CopyButton text={copyText} />
       </div>
+      {d.gitStatus && (
+        <div className={`node-badge node-badge-git node-badge-git-${d.gitStatus}`}>
+          git: {d.gitStatus}
+        </div>
+      )}
       {d.hasNameCollision && (
         <div className="node-badge">name collision</div>
       )}

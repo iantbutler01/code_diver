@@ -10,6 +10,7 @@ interface FileData {
   isHeader?: boolean;
   isReference?: boolean;
   diveRels?: string[];
+  gitStatus?: "added" | "modified" | "deleted";
 }
 
 export function FileNode({ data }: NodeProps) {
@@ -18,6 +19,7 @@ export function FileNode({ data }: NodeProps) {
   const copyText = [
     `File: ${fileName}`,
     `Path: ${d.path}`,
+    d.gitStatus ? `Git status: ${d.gitStatus}` : null,
     d.description ? `Description: ${d.description}` : null,
     ...(d.diveRels || []).map((rel) => `Relation: ${rel}`),
     `Tag count: ${d.tagCount}`,
@@ -29,9 +31,11 @@ export function FileNode({ data }: NodeProps) {
     "node",
     d.isHeader ? "node-file-header" : "node-file",
     d.isReference ? "node-file-ref" : "",
+    d.gitStatus ? `node-git-${d.gitStatus}` : "",
   ]
     .filter(Boolean)
     .join(" ");
+  const isDeleted = d.gitStatus === "deleted";
 
   return (
     <div className={className}>
@@ -41,6 +45,11 @@ export function FileNode({ data }: NodeProps) {
         <CopyButton text={copyText} />
       </div>
       <div className="node-path">{d.path}</div>
+      {d.gitStatus && (
+        <div className={`node-badge node-badge-git node-badge-git-${d.gitStatus}`}>
+          git: {d.gitStatus}
+        </div>
+      )}
       {d.description && <div className="node-desc">{d.description}</div>}
       {d.diveRels && d.diveRels.length > 0 && (
         <div className="node-rels">
@@ -51,16 +60,19 @@ export function FileNode({ data }: NodeProps) {
           ))}
         </div>
       )}
-      {d.tagCount > 0 && !d.isHeader && (
+      {isDeleted && (
+        <div className="node-hint">removed in working tree</div>
+      )}
+      {!isDeleted && d.tagCount > 0 && !d.isHeader && (
         <div className="node-hint">{d.tagCount} tags - click to explore</div>
       )}
-      {d.tagCount === 0 && !d.isHeader && !d.isReference && (
+      {!isDeleted && d.tagCount === 0 && !d.isHeader && !d.isReference && (
         <div className="node-hint">click to open in VS Code</div>
       )}
-      {d.isHeader && (
+      {!isDeleted && d.isHeader && (
         <div className="node-hint">click to open in VS Code</div>
       )}
-      {d.isReference && (
+      {!isDeleted && d.isReference && (
         <div className="node-hint">click to explore</div>
       )}
       <Handle type="source" position={Position.Bottom} />

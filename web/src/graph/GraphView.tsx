@@ -15,7 +15,7 @@ import {
 import "@xyflow/react/dist/style.css";
 
 import type { GraphData, NavEntry } from "../types";
-import { transformGraph } from "./transform";
+import { graphScopeCoverage, transformGraph } from "./transform";
 import { estimateLayoutNodeSize, layoutGraph } from "./layout";
 import { ComponentNode } from "./ComponentNode";
 import { FileNode } from "./FileNode";
@@ -77,6 +77,7 @@ interface GraphNodeData {
   relOut?: number;
   relTotal?: number;
   relRole?: "entry" | "sink" | "hub" | "isolated" | "flow";
+  gitStatus?: "added" | "modified" | "deleted";
 }
 
 interface FolderZone {
@@ -555,6 +556,11 @@ export function GraphView({ data, nav, onNavigate }: Props) {
     [data.static_analysis]
   );
 
+  const scopeCoverage = useMemo(
+    () => graphScopeCoverage(data, nav),
+    [data, nav]
+  );
+
   const folderZones = useMemo(() => {
     if (!folderZonesEnabled) return [];
     if (nav.level === "file") return [];
@@ -639,7 +645,12 @@ export function GraphView({ data, nav, onNavigate }: Props) {
     (event, node: Node) => {
       const d = node.data as GraphNodeData;
       const wantsNavigate = event.metaKey || event.ctrlKey || event.shiftKey;
+      const isDeleted = d.gitStatus === "deleted";
       const markdownNav = markdownNavEntry(node, d);
+
+      if (isDeleted && (node.type === "file" || node.type === "filegroup")) {
+        return;
+      }
 
       if (markdownNav) {
         onNavigate(markdownNav);
@@ -665,6 +676,7 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         // Subsystem group: drill into filtered system view
         onNavigate({ level: "system", label: d.name || "Group", id: d.groupId });
       } else if (node.type === "filegroup") {
+        if (isDeleted) return;
         if (d.isSummary) {
           // Summary node in file view: open in VS Code
           if (d.absPath) openInVscode(d.absPath, 1);
@@ -690,6 +702,7 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         if (!id) return;
         onNavigate({ level: "module", label, id });
       } else if (node.type === "file") {
+        if (isDeleted) return;
         if (d.isHeader && d.absPath) {
           openInVscode(d.absPath, 1);
         } else if (d.isReference && d.path) {
@@ -756,6 +769,15 @@ export function GraphView({ data, nav, onNavigate }: Props) {
             {staticSummary.truncated ? " (truncated)" : ""}
           </span>
         )}
+        {scopeCoverage.staticFiles > 0 && (
+          <span className="graph-toolbar-hint">
+            coverage: {scopeCoverage.representedFiles}/{scopeCoverage.staticFiles} represented
+            {" · "}
+            missing {scopeCoverage.missingFiles}
+            {" · "}
+            {scopeCoverage.representedPct}%
+          </span>
+        )}
         {relationFocusEnabled && (
           <span className="graph-toolbar-hint">
             click node to isolate 1-hop relations, click canvas to clear, hold cmd/ctrl to navigate
@@ -763,42 +785,94 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         )}
       </div>
       <div className="graph-legend" aria-label="Graph color legend">
-        <span className="graph-legend-item">
-          <span className="graph-legend-dot is-component" />
-          component
-        </span>
-        <span className="graph-legend-item">
-          <span className="graph-legend-dot is-file" />
-          file
-        </span>
-        <span className="graph-legend-item">
-          <span className="graph-legend-dot is-group" />
-          group
-        </span>
-        <span className="graph-legend-item">
-          <span className="graph-legend-dot is-tag" />
-          tag
-        </span>
-        <span className="graph-legend-item">
-          <span className="graph-legend-line is-relationship" />
-          semantic rel
-        </span>
-        <span className="graph-legend-item">
-          <span className="graph-legend-line is-static" />
-          static rel
-        </span>
-        <span className="graph-legend-item">
-          <span className="graph-legend-line is-blended" />
-          blended rel
-        </span>
-        <span className="graph-legend-item">
-          <span className="graph-legend-line is-ambiguous" />
-          ambiguous rel
-        </span>
-        <span className="graph-legend-item">
-          <span className="graph-legend-dot is-warning" />
-          warning
-        </span>
+        <div className="graph-legend-section">
+          <span className="graph-legend-label">node outline</span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-outline is-component" />
+            component
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-outline is-file" />
+            file
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-outline is-filegroup" />
+            file group
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-outline is-group" />
+            group
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-outline is-tag" />
+            tag
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-outline is-anchor" />
+            anchor / unannotated
+          </span>
+        </div>
+        <div className="graph-legend-section">
+          <span className="graph-legend-label">git outline</span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-outline is-git-added" />
+            added
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-outline is-git-modified" />
+            modified
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-outline is-git-deleted" />
+            deleted
+          </span>
+        </div>
+        <div className="graph-legend-section">
+          <span className="graph-legend-label">edge line</span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-line is-structure" />
+            structure
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-line is-relationship" />
+            semantic
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-line is-static" />
+            static
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-line is-blended" />
+            blended
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-line is-ambiguous" />
+            ambiguous
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-line is-focus-relationship" />
+            focus semantic
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-line is-focus-static" />
+            focus static
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-line is-focus-blended" />
+            focus blended
+          </span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-line is-focus-structure" />
+            focus structure
+          </span>
+        </div>
+        <div className="graph-legend-section">
+          <span className="graph-legend-label">badge</span>
+          <span className="graph-legend-item">
+            <span className="graph-legend-dot is-warning" />
+            warning badge
+          </span>
+        </div>
       </div>
       <ReactFlow
         nodes={nodes}

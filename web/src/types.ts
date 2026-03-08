@@ -1,5 +1,7 @@
 // Matches Rust GraphData from parser.rs
 
+export type GitDiffStatus = "added" | "modified" | "deleted";
+
 export interface GraphData {
   project_root: string;
   generated_at: string;
@@ -7,7 +9,25 @@ export interface GraphData {
   modules: ModuleDoc[];
   files: FileDiveDoc[];
   static_analysis: StaticAnalysis;
+  coverage: GraphCoverage;
   diagnostics: ParseDiagnostic[];
+  git_status: Record<string, GitDiffStatus>;
+}
+
+export interface GraphCoverage {
+  static_files: number;
+  represented_files: number;
+  missing_files: number;
+  represented_pct: number;
+  group_coverage: GroupCoverage[];
+}
+
+export interface GroupCoverage {
+  group_id: string;
+  static_files: number;
+  represented_files: number;
+  missing_files: number;
+  represented_pct: number;
 }
 
 export interface OverviewDoc {

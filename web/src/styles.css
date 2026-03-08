@@ -45,6 +45,9 @@
   --color-warning-text: #fde68a;
   --color-warning-text-soft: #fef3c7;
   --color-error: #ef4444;
+  --color-git-added: #22c55e;
+  --color-git-modified: #f59e0b;
+  --color-git-deleted: #ef4444;
 
   /* Existing aliases kept for backwards compatibility in selectors below */
   --bg: var(--color-surface-canvas);
@@ -200,14 +203,22 @@ body {
   left: 16px;
   z-index: 9;
   display: flex;
-  align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  padding: 5px 9px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 4px;
+  padding: 7px 10px;
   border-radius: 8px;
   border: 1px solid var(--line);
   background: var(--color-panel-bg);
   backdrop-filter: blur(4px);
+  max-width: min(1100px, calc(100vw - 34px));
+}
+
+.graph-legend-section {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
 }
 
 .graph-legend-item {
@@ -220,6 +231,22 @@ body {
   letter-spacing: 0.01em;
 }
 
+.graph-legend-label {
+  font-size: 0.66rem;
+  color: #cbd5e1;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-weight: 700;
+  margin-right: 2px;
+}
+
+.graph-legend-sep {
+  width: 1px;
+  height: 12px;
+  background: var(--line);
+  opacity: 0.8;
+}
+
 .graph-legend-dot {
   width: 8px;
   height: 8px;
@@ -227,24 +254,67 @@ body {
   display: inline-block;
 }
 
-.graph-legend-dot.is-component {
-  background: var(--color-node-component);
-}
-
-.graph-legend-dot.is-file {
-  background: var(--color-node-file);
-}
-
-.graph-legend-dot.is-group {
-  background: var(--color-node-group);
-}
-
-.graph-legend-dot.is-tag {
-  background: var(--color-node-tag);
-}
-
 .graph-legend-dot.is-warning {
   background: var(--color-warning);
+}
+
+.graph-legend-outline {
+  width: 12px;
+  height: 9px;
+  border-radius: 2px;
+  border: 2px solid transparent;
+  border-left-width: 3px;
+  background: #0f172a;
+  display: inline-block;
+}
+
+.graph-legend-outline.is-component {
+  border-color: var(--color-node-component);
+}
+
+.graph-legend-outline.is-file {
+  border-color: var(--color-node-file);
+}
+
+.graph-legend-outline.is-filegroup {
+  border-color: var(--color-node-file-group);
+}
+
+.graph-legend-outline.is-group {
+  border-color: var(--color-node-group);
+}
+
+.graph-legend-outline.is-tag {
+  border-color: var(--color-node-tag);
+}
+
+.graph-legend-outline.is-anchor {
+  border-color: #64748b;
+  border-left-color: #475569;
+  background: #111827;
+  border-style: dashed;
+}
+
+.graph-legend-outline.is-git-added {
+  border-color: var(--color-git-added);
+  border-style: dashed;
+}
+
+.graph-legend-outline.is-git-modified {
+  border-color: var(--color-git-modified);
+  border-style: dashed;
+}
+
+.graph-legend-outline.is-git-deleted {
+  border-color: var(--color-git-deleted);
+  border-style: dashed;
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgba(2, 6, 23, 0.92) 0,
+    rgba(2, 6, 23, 0.92) 3px,
+    rgba(17, 24, 39, 0.96) 3px,
+    rgba(17, 24, 39, 0.96) 6px
+  );
 }
 
 .graph-legend-line {
@@ -252,6 +322,10 @@ body {
   height: 0;
   border-top: 2px solid transparent;
   display: inline-block;
+}
+
+.graph-legend-line.is-structure {
+  border-color: var(--color-edge-structure);
 }
 
 .graph-legend-line.is-relationship {
@@ -268,6 +342,22 @@ body {
 
 .graph-legend-line.is-ambiguous {
   border-color: var(--color-edge-ambiguous);
+}
+
+.graph-legend-line.is-focus-relationship {
+  border-color: var(--color-edge-focus-relationship);
+}
+
+.graph-legend-line.is-focus-static {
+  border-color: var(--color-edge-focus-static);
+}
+
+.graph-legend-line.is-focus-blended {
+  border-color: var(--color-edge-focus-blended);
+}
+
+.graph-legend-line.is-focus-structure {
+  border-color: var(--color-edge-focus-structure);
 }
 
 .folder-zones-layer {
@@ -581,6 +671,54 @@ body {
 .node:hover {
   border-color: var(--accent);
   box-shadow: 0 0 12px var(--color-node-component-glow);
+}
+
+.node-git-added {
+  border-color: var(--color-git-added) !important;
+  border-style: dashed !important;
+  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.35), 0 0 14px rgba(34, 197, 94, 0.25);
+}
+
+.node-git-modified {
+  border-color: var(--color-git-modified) !important;
+  border-style: dashed !important;
+  box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.35), 0 0 12px rgba(245, 158, 11, 0.2);
+}
+
+.node-git-deleted {
+  border-color: var(--color-git-deleted) !important;
+  border-style: dashed !important;
+  background-color: #090d16 !important;
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgba(2, 6, 23, 0.92) 0,
+    rgba(2, 6, 23, 0.92) 9px,
+    rgba(17, 24, 39, 0.96) 9px,
+    rgba(17, 24, 39, 0.96) 18px
+  );
+  box-shadow: 0 0 0 1px rgba(239, 68, 68, 0.42), 0 0 14px rgba(239, 68, 68, 0.24);
+}
+
+.node-badge-git {
+  text-transform: uppercase;
+}
+
+.node-badge-git-added {
+  color: #86efac;
+  border-color: rgba(34, 197, 94, 0.5);
+  background: rgba(20, 83, 45, 0.3);
+}
+
+.node-badge-git-modified {
+  color: #fcd34d;
+  border-color: rgba(245, 158, 11, 0.5);
+  background: rgba(120, 53, 15, 0.3);
+}
+
+.node-badge-git-deleted {
+  color: #fca5a5;
+  border-color: rgba(239, 68, 68, 0.55);
+  background: rgba(127, 29, 29, 0.3);
 }
 
 .node-group {
