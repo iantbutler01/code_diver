@@ -124,11 +124,56 @@ export interface MarkdownDoc {
 
 // Navigation
 
-export type NavLevel = "system" | "module" | "file" | "doc";
+export type NavLevel = "system" | "module" | "file" | "doc" | "diff";
+
+export type DiffBaseline = "head_worktree";
+
+export interface DiffNavOrigin {
+  level: Exclude<NavLevel, "diff">;
+  label: string;
+  id?: string;
+}
+
+export interface DiffNavPayload {
+  seedPaths: string[];
+  originScope: DiffNavOrigin;
+  maxHops: number;
+  baseline?: DiffBaseline;
+}
 
 export interface NavEntry {
   level: NavLevel;
   label: string;
   /** Module name or file path, undefined for system */
   id?: string;
+  diff?: DiffNavPayload;
+}
+
+export interface DiffHunkLine {
+  kind: "add" | "del" | "context" | "meta";
+  text: string;
+}
+
+export interface DiffHunk {
+  header: string;
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  lines: DiffHunkLine[];
+}
+
+export interface DiffFile {
+  path: string;
+  status: GitDiffStatus | "unknown";
+  patch: string;
+  hunks: DiffHunk[];
+  truncated?: boolean;
+}
+
+export interface DiffResponse {
+  baseline: DiffBaseline;
+  files: DiffFile[];
+  truncated: boolean;
+  file_count: number;
 }

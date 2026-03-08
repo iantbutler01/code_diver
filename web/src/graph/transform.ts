@@ -659,7 +659,7 @@ function attachUnannotatedBucket(
   coverage: GraphScopeCoverage,
   nav: NavEntry
 ) {
-  if (coverage.missingFiles <= 0 || nav.level === "file") return;
+  if (coverage.missingFiles <= 0 || nav.level === "file" || nav.level === "diff") return;
 
   const scopeId = `${nav.level}:${nav.id || "__root__"}`;
   const nodeId = `group:coverage:unannotated:${scopeId}`;
@@ -688,6 +688,145 @@ function attachUnannotatedBucket(
   if (anchor) {
     addStructuralEdge(edges, anchor.id, nodeId);
   }
+}
+
+function changedPaths(data: GraphData): string[] {
+  const out = new Set<string>();
+  for (const path of Object.keys(data.git_status || {})) {
+    const normalized = normalizeTargetPath(path);
+    if (!normalized) continue;
+    out.add(normalized);
+  }
+  return [...out].sort((a, b) => a.localeCompare(b));
+}
+
+function moduleTokenPatterns(data: GraphData, moduleId: string): string[] {
+  const out = new Set<string>();
+  const mod = findModule(data, moduleId);
+  if (mod) {
+    out.add(`${mod.name}/`);
+    for (const file of mod.files || []) {
+      const normalized = normalizeTargetPath(file.path);
+      if (!normalized) continue;
+      out.add(normalized);
+    }
+  } else if (moduleId) {
+    out.add(`${normalizeTargetPath(moduleId)}/`);
+  }
+  return [...out];
+}
+
+function changedMatchesToken(
+  token: string | null | undefined,
+  changed: string[]
+): string[] {
+  if (!token) return [];
+  const pattern = toPathPattern(token);
+  if (!pattern) return [];
+  return changed.filter((path) => pathMatchesPattern(path, pattern));
+}
+
+function changedMatchesChildren(children: unknown, changed: string[]): string[] {
+  if (!Array.isArray(children)) return [];
+  const matches = new Set<string>();
+  for (const raw of children) {
+    if (typeof raw !== "string") continue;
+    if (!isLikelyPathToken(raw)) continue;
+    for (const path of changedMatchesToken(raw, changed)) {
+      matches.add(path);
+    }
+  }
+  return [...matches];
+}
+
+function nodeDiffPaths(
+  node: Node,
+  data: GraphData,
+  changed: string[]
+): string[] {
+  const d = node.data as Record<string, unknown>;
+  const found = new Set<string>();
+
+  const addMatches = (token: string | null | undefined) => {
+    for (const path of changedMatchesToken(token, changed)) {
+      found.add(path);
+    }
+  };
+
+  const addMatchesList = (values: string[]) => {
+    for (const value of values) addMatches(value);
+  };
+
+  const rawPath = typeof d.path === "string" ? d.path : null;
+  const rawTarget = typeof d.target === "string" ? d.target : null;
+  const rawDirPath = typeof d.dirPath === "string" ? d.dirPath : null;
+  const rawModuleId = typeof d.moduleId === "string" ? d.moduleId : null;
+  const rawGroupId = typeof d.groupId === "string" ? d.groupId : null;
+
+  addMatches(rawPath);
+  addMatches(rawTarget);
+  addMatches(rawDirPath);
+  addMatchesList(changedMatchesChildren(d.children, changed));
+
+  if (rawModuleId && rawModuleId.trim()) {
+    addMatchesList(moduleTokenPatterns(data, rawModuleId));
+  }
+
+  if (rawGroupId && rawGroupId.trim()) {
+    if (rawGroupId.startsWith("path:")) {
+      addMatches(`${rawGroupId.slice(5)}/`);
+    } else if (rawGroupId.startsWith(MODULE_DIR_FILTER_PREFIX)) {
+      const parsed = parseModuleDirFilterId(rawGroupId);
+      if (parsed) {
+        addMatches(`${parsed.dirPrefix}/`);
+      }
+    } else if (rawGroupId.startsWith(MODULE_CLUSTER_PREFIX)) {
+      const parsed = parseModuleClusterFilterId(rawGroupId);
+      if (parsed && parsed.moduleBucketId !== "__unmapped__") {
+        addMatchesList(moduleTokenPatterns(data, parsed.moduleBucketId));
+      }
+    } else if (!rawGroupId.includes(":")) {
+      addMatches(`${rawGroupId}/`);
+      addMatches(rawGroupId);
+    }
+  }
+
+  if (node.type === "tag") {
+    const absPath = typeof d.absPath === "string" ? d.absPath : "";
+    const project = normalizeTargetPath(data.project_root);
+    if (absPath && project && absPath.startsWith(project)) {
+      const rel = normalizeTargetPath(absPath.slice(project.length));
+      addMatches(rel);
+    }
+  }
+
+  return [...found].sort((a, b) => a.localeCompare(b));
+}
+
+function annotateNodesWithDiffPaths(data: GraphData, nodes: Node[]): Node[] {
+  const changed = changedPaths(data);
+  if (changed.length === 0) {
+    return nodes.map((node) => ({
+      ...node,
+      data: {
+        ...(node.data as Record<string, unknown>),
+        diffPaths: [],
+        hasChanges: false,
+      },
+    }));
+  }
+
+  return nodes.map((node) => {
+    const diffPaths = nodeDiffPaths(node, data, changed);
+    return {
+      ...node,
+      data: {
+        ...(node.data as Record<string, unknown>),
+        diffPaths,
+        hasChanges: diffPaths.length > 0,
+      },
+    };
+  });
 }
 
 function buildModuleBuckets(
@@ -2054,20 +2193,29 @@ export function transformGraph(
   if (nav.level === "system") result = systemLevel(data, nav.id);
   else if (nav.level === "module") result = moduleLevel(data, nav.id!, nav.label);
   else if (nav.level === "file") result = fileLevel(data, nav.id!);
+  else if (nav.level === "diff") result = diffLevel(data, nav);
   else result = { nodes: [], edges: [] };
 
   const coverage = graphScopeCoverage(data, nav);
   attachUnannotatedBucket(result.nodes, result.edges, coverage, nav);
+  result.nodes = annotateNodesWithDiffPaths(data, result.nodes);
 
   if (result.nodes.length > 0) {
-    const withStatic = addStaticRelationships(data, nav, result.nodes, result.edges);
-    const withCollapsedParallels = collapseParallelRelationEdges(withStatic);
-    const withBackbone = addGeneratedLayoutBackbone(result.nodes, withCollapsedParallels);
-    const withPolicy = applyConnectivityPolicy(result.nodes, withBackbone, nav);
-    result = {
-      nodes: result.nodes,
-      edges: separateParallelRelationEdges(withPolicy),
-    };
+    if (nav.level === "diff") {
+      result = {
+        nodes: result.nodes,
+        edges: separateParallelRelationEdges(collapseParallelRelationEdges(result.edges)),
+      };
+    } else {
+      const withStatic = addStaticRelationships(data, nav, result.nodes, result.edges);
+      const withCollapsedParallels = collapseParallelRelationEdges(withStatic);
+      const withBackbone = addGeneratedLayoutBackbone(result.nodes, withCollapsedParallels);
+      const withPolicy = applyConnectivityPolicy(result.nodes, withBackbone, nav);
+      result = {
+        nodes: result.nodes,
+        edges: separateParallelRelationEdges(withPolicy),
+      };
+    }
   }
 
   if (result.nodes.length === 0) {
@@ -2653,6 +2801,337 @@ function flatSystemLevel(data: GraphData): { nodes: Node[]; edges: Edge[] } {
       }
       addDiveRelEdges(data, nodes, edges);
     }
+  }
+
+  return { nodes, edges };
+}
+
+interface DiffRelationRecord {
+  source: string;
+  target: string;
+  labels: Set<string>;
+  evidence: Set<"semantic" | "static">;
+  staticKinds: Set<string>;
+}
+
+interface DiffGroupRecord {
+  id: string;
+  label: string;
+  children: Set<string>;
+  minHop: number;
+}
+
+interface DiffModuleRecord {
+  id: string;
+  label: string;
+  groupId: string;
+  moduleId: string | null;
+  children: Set<string>;
+  minHop: number;
+}
+
+function buildDiffRelationRecords(data: GraphData): Map<string, DiffRelationRecord> {
+  const out = new Map<string, DiffRelationRecord>();
+  const upsert = (
+    source: string,
+    target: string,
+    evidence: "semantic" | "static",
+    label?: string,
+    staticKind?: string
+  ) => {
+    const src = normalizeTargetPath(source);
+    const tgt = normalizeTargetPath(target);
+    if (!src || !tgt || src === tgt) return;
+    const key = `${src}->${tgt}`;
+    const record = out.get(key) || {
+      source: src,
+      target: tgt,
+      labels: new Set<string>(),
+      evidence: new Set<"semantic" | "static">(),
+      staticKinds: new Set<string>(),
+    };
+    record.evidence.add(evidence);
+    if (label && label.trim()) record.labels.add(label.trim());
+    if (staticKind && staticKind.trim()) record.staticKinds.add(staticKind.trim());
+    out.set(key, record);
+  };
+
+  for (const edge of data.static_analysis?.edges || []) {
+    upsert(edge.source_path, edge.target_path, "static", edge.kind, edge.kind);
+  }
+
+  for (const file of data.files || []) {
+    for (const rel of file.dive_rel || []) {
+      const refPath = extractFileRef(rel, data);
+      if (!refPath) continue;
+      upsert(file.path, refPath, "semantic", extractRelLabel(rel, refPath));
+    }
+  }
+
+  return out;
+}
+
+function bfsDiffHops(
+  seeds: string[],
+  relations: Map<string, DiffRelationRecord>,
+  maxHops: number
+): Map<string, number> {
+  const adjacency = new Map<string, Set<string>>();
+  const connect = (a: string, b: string) => {
+    const setA = adjacency.get(a) || new Set<string>();
+    setA.add(b);
+    adjacency.set(a, setA);
+  };
+
+  for (const edge of relations.values()) {
+    connect(edge.source, edge.target);
+    connect(edge.target, edge.source);
+  }
+
+  const hops = new Map<string, number>();
+  const queue: Array<{ path: string; hop: number }> = [];
+  for (const seed of seeds) {
+    const normalized = normalizeTargetPath(seed);
+    if (!normalized || hops.has(normalized)) continue;
+    hops.set(normalized, 0);
+    queue.push({ path: normalized, hop: 0 });
+  }
+
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current) continue;
+    if (current.hop >= maxHops) continue;
+    for (const next of adjacency.get(current.path) || new Set<string>()) {
+      if (hops.has(next)) continue;
+      hops.set(next, current.hop + 1);
+      queue.push({ path: next, hop: current.hop + 1 });
+    }
+  }
+
+  return hops;
+}
+
+function relationStyleForEvidence(
+  evidence: Set<"semantic" | "static">
+): { stroke: string; strokeWidth: number; strokeDasharray?: string } {
+  const hasSemantic = evidence.has("semantic");
+  const hasStatic = evidence.has("static");
+  if (hasSemantic && hasStatic) {
+    return { stroke: graphColors.edgeBlended, strokeWidth: 1.7 };
+  }
+  if (hasStatic) {
+    return { stroke: graphColors.edgeStatic, strokeWidth: 1.55 };
+  }
+  return { stroke: graphColors.edgeRelationship, strokeWidth: 1.65 };
+}
+
+function sortedSetValues(values: Set<string>): string[] {
+  return [...values].sort((a, b) => a.localeCompare(b));
+}
+
+function changedSubset(paths: string[], changedSet: Set<string>): string[] {
+  return paths.filter((path) => changedSet.has(path));
+}
+
+function primaryDiffRelationLabel(relation: DiffRelationRecord): string {
+  if (relation.labels.size > 0) return [...relation.labels][0];
+  if (relation.staticKinds.size > 0) return [...relation.staticKinds][0];
+  return "related";
+}
+
+function diffFileNodeId(path: string): string {
+  return `diff:file:${path}`;
+}
+
+function diffTagNodeId(path: string, line: number): string {
+  return `diff:tag:${path}:${line}`;
+}
+
+function makeDiffGroupNode(group: DiffGroupRecord, changedSet: Set<string>): Node {
+  const children = sortedSetValues(group.children);
+  const changedChildren = changedSubset(children, changedSet);
+  return {
+    id: group.id,
+    type: "group",
+    position: { x: 0, y: 0 },
+    data: {
+      name: group.label,
+      count: children.length,
+      children,
+      groupId: group.label.replace(/\/$/, ""),
+      nonNavigable: true,
+      diffHop: group.minHop,
+      diffLane: "group",
+      diffPaths: changedChildren,
+      hasChanges: changedChildren.length > 0,
+    },
+  };
+}
+
+function makeDiffModuleNode(moduleRec: DiffModuleRecord, changedSet: Set<string>): Node {
+  const children = sortedSetValues(moduleRec.children);
+  const changedChildren = changedSubset(children, changedSet);
+  return {
+    id: moduleRec.id,
+    type: "group",
+    position: { x: 0, y: 0 },
+    data: {
+      name: moduleRec.label,
+      count: children.length,
+      children,
+      groupId: moduleRec.moduleId || moduleRec.label,
+      moduleId: moduleRec.moduleId,
+      nonNavigable: true,
+      diffHop: moduleRec.minHop,
+      diffLane: "module",
+      diffPaths: changedChildren,
+      hasChanges: changedChildren.length > 0,
+    },
+  };
+}
+
+function makeDiffRelationEdge(relation: DiffRelationRecord, index: number): Edge {
+  const evidence = [...relation.evidence];
+  return {
+    id: `e-diff-rel-${index}`,
+    source: diffFileNodeId(relation.source),
+    target: diffFileNodeId(relation.target),
+    label: primaryDiffRelationLabel(relation),
+    animated: relation.evidence.has("semantic"),
+    style: relationStyleForEvidence(relation.evidence),
+    data: {
+      kind: "relationship",
+      layout: false,
+      evidence,
+      staticKind: relation.staticKinds.size > 0 ? [...relation.staticKinds][0] : undefined,
+    },
+  };
+}
+
+function diffLevel(data: GraphData, nav: NavEntry): { nodes: Node[]; edges: Edge[] } {
+  const gitStatus = data.git_status || {};
+  const changed = changedPaths(data);
+  const changedSet = new Set(changed);
+  const navSeeds = (nav.diff?.seedPaths || []).map((path) => normalizeTargetPath(path));
+  const seedPaths = navSeeds.filter((path) => !!path && changedSet.has(path));
+  const seeds = seedPaths.length > 0 ? seedPaths : changed.slice(0, 1);
+  const maxHops = Math.max(0, Math.min(2, nav.diff?.maxHops ?? 2));
+
+  if (seeds.length === 0) {
+    return { nodes: [], edges: [] };
+  }
+
+  const relations = buildDiffRelationRecords(data);
+  const hops = bfsDiffHops(seeds, relations, maxHops);
+  for (const seed of seeds) {
+    if (!hops.has(seed)) hops.set(seed, 0);
+  }
+  const includedPaths = [...hops.keys()].sort((a, b) => a.localeCompare(b));
+  if (includedPaths.length === 0) {
+    return { nodes: [], edges: [] };
+  }
+
+  const fileByPath = new Map<string, FileDiveDoc>();
+  for (const file of data.files || []) {
+    fileByPath.set(normalizeTargetPath(file.path), file);
+  }
+
+  const nodes: Node[] = [];
+  const edges: Edge[] = [];
+  const groupById = new Map<string, DiffGroupRecord>();
+  const moduleById = new Map<string, DiffModuleRecord>();
+  const fileToModule = new Map<string, string>();
+
+  for (const path of includedPaths) {
+    const hop = Math.min(maxHops, hops.get(path) ?? maxHops);
+    const segments = path.split("/").filter(Boolean);
+    const top = segments[0] || "root";
+    const groupId = `diff:group:${top}`;
+    const group = groupById.get(groupId) || {
+      id: groupId,
+      label: `${top}/`,
+      children: new Set<string>(),
+      minHop: hop,
+    };
+    group.minHop = Math.min(group.minHop, hop);
+    group.children.add(path);
+    groupById.set(groupId, group);
+
+    const mod = findModuleByTarget(data, path);
+    const moduleKey = mod?.name || `__${top}__`;
+    const moduleNodeId = `diff:module:${moduleKey}`;
+    const moduleRec = moduleById.get(moduleNodeId) || {
+      id: moduleNodeId,
+      label: mod?.title || mod?.name || `${top} module`,
+      groupId,
+      moduleId: mod?.name || null,
+      children: new Set<string>(),
+      minHop: hop,
+    };
+    moduleRec.minHop = Math.min(moduleRec.minHop, hop);
+    moduleRec.children.add(path);
+    moduleById.set(moduleNodeId, moduleRec);
+    fileToModule.set(path, moduleNodeId);
+
+    const fileDoc = fileByPath.get(path);
+    const status = gitStatus[path];
+    const fileNodeId = diffFileNodeId(path);
+    nodes.push({
+      id: fileNodeId,
+      type: "file",
+      position: { x: 0, y: 0 },
+      data: {
+        path,
+        absPath: fileDoc?.abs_path || `${data.project_root}/${path}`,
+        description: fileDoc?.dive_file || "No @dive-file narrative",
+        tagCount: fileDoc?.tags.length || 0,
+        hasDiveMeta: !!fileDoc,
+        gitStatus: status,
+        diffPaths: [path],
+        hasChanges: changedSet.has(path),
+        diffHop: hop,
+        diffLane: "file",
+      },
+    });
+
+    for (const tag of (fileDoc?.tags || []).slice(0, 10)) {
+      const tagNodeId = diffTagNodeId(path, tag.line);
+      nodes.push({
+        id: tagNodeId,
+        type: "tag",
+        position: { x: 0, y: 0 },
+        data: {
+          line: tag.line,
+          description: tag.description,
+          absPath: fileDoc?.abs_path || `${data.project_root}/${path}`,
+          diffHop: hop,
+          diffLane: "tag",
+          diffPaths: [path],
+          hasChanges: changedSet.has(path),
+        },
+      });
+      addStructuralEdge(edges, fileNodeId, tagNodeId);
+    }
+  }
+
+  for (const group of [...groupById.values()].sort((a, b) => a.label.localeCompare(b.label))) {
+    nodes.push(makeDiffGroupNode(group, changedSet));
+  }
+
+  for (const moduleRec of [...moduleById.values()].sort((a, b) => a.label.localeCompare(b.label))) {
+    nodes.push(makeDiffModuleNode(moduleRec, changedSet));
+  }
+
+  for (const [path, moduleNodeId] of fileToModule) {
+    const groupId = moduleById.get(moduleNodeId)?.groupId;
+    if (groupId) addStructuralEdge(edges, groupId, moduleNodeId);
+    addStructuralEdge(edges, moduleNodeId, diffFileNodeId(path));
+  }
+
+  let relIndex = 0;
+  for (const relation of relations.values()) {
+    if (!hops.has(relation.source) || !hops.has(relation.target)) continue;
+    edges.push(makeDiffRelationEdge(relation, relIndex++));
   }
 
   return { nodes, edges };

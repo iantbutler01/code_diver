@@ -1,4 +1,4 @@
-import { useMemo, useCallback, useEffect, useRef, useState, type MouseEvent } from "react";
+import { useMemo, useCallback, useEffect, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import {
   ReactFlow,
   Background,
@@ -14,16 +14,16 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 
-import type { GraphData, NavEntry } from "../types";
+import type { DiffResponse, GraphData, NavEntry } from "../types";
 import { graphScopeCoverage, transformGraph } from "./transform";
-import { estimateLayoutNodeSize, layoutGraph } from "./layout";
+import { estimateLayoutNodeSize, layoutDiffGraph, layoutGraph } from "./layout";
 import { ComponentNode } from "./ComponentNode";
 import { FileNode } from "./FileNode";
 import { TagNode } from "./TagNode";
 import { GroupNode } from "./GroupNode";
 import { FileGroupNode } from "./FileGroupNode";
 import { RelationEdge } from "./RelationEdge";
-import { openInVscode } from "../api";
+import { fetchDiff, openInVscode } from "../api";
 import { graphColors, minimapNodeColor } from "./colors";
 
 const nodeTypes = {
@@ -78,6 +78,10 @@ interface GraphNodeData {
   relTotal?: number;
   relRole?: "entry" | "sink" | "hub" | "isolated" | "flow";
   gitStatus?: "added" | "modified" | "deleted";
+  diffPaths?: string[];
+  hasChanges?: boolean;
+  diffHop?: number;
+  diffLane?: "group" | "module" | "file" | "tag";
 }
 
 interface FolderZone {
@@ -99,6 +103,166 @@ interface CycleZone {
   y: number;
   width: number;
   height: number;
+}
+
+interface DiffLaneZone {
+  key: string;
+  label: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface DiffBandZone {
+  key: string;
+  label: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface DiffDockState {
+  open: boolean;
+  title: string;
+  key: string;
+  paths: string[];
+  loading: boolean;
+  error: string | null;
+  response: DiffResponse | null;
+  noChanges: boolean;
+}
+
+interface RectZone {
+  key: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+interface DiffDockStateArgs {
+  title: string;
+  key: string;
+  paths: string[];
+  loading?: boolean;
+  error?: string | null;
+  response?: DiffResponse | null;
+  noChanges?: boolean;
+}
+
+interface DiffDockSelection {
+  files: DiffResponse["files"];
+  activeFileIndex: number;
+  activeFile: DiffResponse["files"][number] | null;
+  hunks: DiffResponse["files"][number]["hunks"];
+  activeHunkIndex: number;
+  activeHunk: DiffResponse["files"][number]["hunks"][number] | null;
+}
+
+const CLOSED_DIFF_DOCK: DiffDockState = {
+  open: false,
+  title: "",
+  key: "",
+  paths: [],
+  loading: false,
+  error: null,
+  response: null,
+  noChanges: false,
+};
+
+function buildDiffDockState({
+  title,
+  key,
+  paths,
+  loading = false,
+  error = null,
+  response = null,
+  noChanges = false,
+}: DiffDockStateArgs): DiffDockState {
+  return {
+    open: true,
+    title,
+    key,
+    paths,
+    loading,
+    error,
+    response,
+    noChanges,
+  };
+}
+
+function clampIndex(index: number, length: number): number {
+  if (length <= 0) return 0;
+  return Math.max(0, Math.min(index, length - 1));
+}
+
+function nodeDiffDockTitle(node: Node, data: GraphNodeData): string {
+  return (
+    data.name ||
+    data.path ||
+    data.target ||
+    (node.type === "tag" ? `tag:${data.line || "?"}` : node.id)
+  );
+}
+
+function diffOriginLevel(level: NavEntry["level"]): "system" | "module" | "file" {
+  if (level === "diff") return "system";
+  if (level === "doc") return "file";
+  return level;
+}
+
+function deriveDiffDockSelection(
+  response: DiffResponse | null,
+  activeFileIndex: number,
+  activeHunkIndex: number
+): DiffDockSelection {
+  const files = response?.files || [];
+  const safeFileIndex = clampIndex(activeFileIndex, files.length);
+  const activeFile = files[safeFileIndex] || null;
+  const hunks = activeFile?.hunks || [];
+  const safeHunkIndex = clampIndex(activeHunkIndex, hunks.length);
+  const activeHunk = hunks[safeHunkIndex] || null;
+
+  return {
+    files,
+    activeFileIndex: safeFileIndex,
+    activeFile,
+    hunks,
+    activeHunkIndex: safeHunkIndex,
+    activeHunk,
+  };
+}
+
+function renderViewportZones<T extends RectZone>(
+  zones: T[],
+  layerClass: string,
+  zoneClass: (zone: T) => string,
+  labelClass: string,
+  renderLabel: (zone: T) => ReactNode
+): ReactNode {
+  if (zones.length === 0) return null;
+
+  return (
+    <ViewportPortal>
+      <div className={layerClass}>
+        {zones.map((zone) => (
+          <div
+            key={zone.key}
+            className={zoneClass(zone)}
+            style={{
+              width: `${zone.width}px`,
+              height: `${zone.height}px`,
+              transform: `translate(${zone.x}px, ${zone.y}px)`,
+            }}
+          >
+            <div className={labelClass}>{renderLabel(zone)}</div>
+          </div>
+        ))}
+      </div>
+    </ViewportPortal>
+  );
 }
 
 function normalizePath(value: string): string {
@@ -355,6 +519,95 @@ function buildCycleZones(nodes: Node[], edges: Edge[]): CycleZone[] {
     .slice(0, 16);
 }
 
+function diffLaneForNode(node: Node): GraphNodeData["diffLane"] | null {
+  const d = node.data as GraphNodeData;
+  if (!d.diffLane) return null;
+  if (d.diffLane === "group" || d.diffLane === "module" || d.diffLane === "file" || d.diffLane === "tag") {
+    return d.diffLane;
+  }
+  return null;
+}
+
+function buildDiffLaneZones(nodes: Node[]): DiffLaneZone[] {
+  const lanes = new Map<string, { minX: number; minY: number; maxX: number; maxY: number }>();
+
+  for (const node of nodes) {
+    const lane = diffLaneForNode(node);
+    if (!lane) continue;
+    const size = estimateLayoutNodeSize(node);
+    const x1 = node.position.x;
+    const y1 = node.position.y;
+    const x2 = x1 + size.width;
+    const y2 = y1 + size.height;
+    const current = lanes.get(lane);
+    if (!current) {
+      lanes.set(lane, { minX: x1, minY: y1, maxX: x2, maxY: y2 });
+      continue;
+    }
+    current.minX = Math.min(current.minX, x1);
+    current.minY = Math.min(current.minY, y1);
+    current.maxX = Math.max(current.maxX, x2);
+    current.maxY = Math.max(current.maxY, y2);
+  }
+
+  return [...lanes.entries()]
+    .map(([lane, bounds]) => ({
+      key: `lane:${lane}`,
+      label: lane,
+      x: bounds.minX - 34,
+      y: bounds.minY - 34,
+      width: bounds.maxX - bounds.minX + 68,
+      height: bounds.maxY - bounds.minY + 68,
+    }))
+    .sort((a, b) => a.x - b.x);
+}
+
+function buildDiffBandZones(nodes: Node[]): DiffBandZone[] {
+  const bands = new Map<number, { minX: number; minY: number; maxX: number; maxY: number }>();
+
+  for (const node of nodes) {
+    const d = node.data as GraphNodeData;
+    const hop = typeof d.diffHop === "number" ? d.diffHop : -1;
+    if (hop < 0) continue;
+    const boundedHop = Math.max(0, Math.min(2, hop));
+    const size = estimateLayoutNodeSize(node);
+    const x1 = node.position.x;
+    const y1 = node.position.y;
+    const x2 = x1 + size.width;
+    const y2 = y1 + size.height;
+    const current = bands.get(boundedHop);
+    if (!current) {
+      bands.set(boundedHop, { minX: x1, minY: y1, maxX: x2, maxY: y2 });
+      continue;
+    }
+    current.minX = Math.min(current.minX, x1);
+    current.minY = Math.min(current.minY, y1);
+    current.maxX = Math.max(current.maxX, x2);
+    current.maxY = Math.max(current.maxY, y2);
+  }
+
+  return [...bands.entries()]
+    .map(([hop, bounds]) => ({
+      key: `band:${hop}`,
+      label: `hop ${hop}`,
+      x: bounds.minX - 42,
+      y: bounds.minY - 44,
+      width: bounds.maxX - bounds.minX + 84,
+      height: bounds.maxY - bounds.minY + 88,
+    }))
+    .sort((a, b) => a.y - b.y);
+}
+
+function normalizeDiffPaths(paths: string[] | undefined): string[] {
+  const set = new Set<string>();
+  for (const raw of paths || []) {
+    const normalized = normalizePath(raw);
+    if (!normalized) continue;
+    set.add(normalized);
+  }
+  return [...set].sort((a, b) => a.localeCompare(b));
+}
+
 function isMarkdownPath(path: string | null | undefined): boolean {
   if (!path) return false;
   const normalized = path.toLowerCase();
@@ -500,6 +753,11 @@ export function GraphView({ data, nav, onNavigate }: Props) {
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
   const [folderZonesEnabled, setFolderZonesEnabled] = useState(true);
   const [cycleZonesEnabled, setCycleZonesEnabled] = useState(true);
+  const [diffDock, setDiffDock] = useState<DiffDockState>(() => ({ ...CLOSED_DIFF_DOCK }));
+  const [activeDiffFile, setActiveDiffFile] = useState(0);
+  const [activeDiffHunk, setActiveDiffHunk] = useState(0);
+  const diffCacheRef = useRef<Map<string, DiffResponse>>(new Map());
+  const hoverRequestRef = useRef(0);
   const flowRef = useRef<ReactFlowInstance<Node, Edge> | null>(null);
   const pendingFitScopeRef = useRef<string | null>(null);
 
@@ -510,7 +768,7 @@ export function GraphView({ data, nav, onNavigate }: Props) {
   const { layoutNodes, layoutEdges } = useMemo(() => {
     try {
       const { nodes, edges } = transformGraph(data, nav);
-      const positioned = layoutGraph(nodes, edges);
+      const positioned = nav.level === "diff" ? layoutDiffGraph(nodes, edges) : layoutGraph(nodes, edges);
       return { layoutNodes: positioned, layoutEdges: edges };
     } catch (err) {
       console.error("[graph] layout failed; using fallback positioning", err);
@@ -563,15 +821,25 @@ export function GraphView({ data, nav, onNavigate }: Props) {
 
   const folderZones = useMemo(() => {
     if (!folderZonesEnabled) return [];
-    if (nav.level === "file") return [];
+    if (nav.level === "file" || nav.level === "diff") return [];
     return buildFolderZones(enrichedLayoutNodes);
   }, [enrichedLayoutNodes, nav.level, folderZonesEnabled]);
 
   const cycleZones = useMemo(() => {
     if (!cycleZonesEnabled) return [];
-    if (nav.level === "file") return [];
+    if (nav.level === "file" || nav.level === "diff") return [];
     return buildCycleZones(enrichedLayoutNodes, layoutEdges);
   }, [enrichedLayoutNodes, layoutEdges, nav.level, cycleZonesEnabled]);
+
+  const diffLaneZones = useMemo(
+    () => (nav.level === "diff" ? buildDiffLaneZones(enrichedLayoutNodes) : []),
+    [enrichedLayoutNodes, nav.level]
+  );
+
+  const diffBandZones = useMemo(
+    () => (nav.level === "diff" ? buildDiffBandZones(enrichedLayoutNodes) : []),
+    [enrichedLayoutNodes, nav.level]
+  );
 
   const { nodes: displayNodes, edges: displayEdges } = useMemo(
     () =>
@@ -608,6 +876,28 @@ export function GraphView({ data, nav, onNavigate }: Props) {
     }
   }, [displayNodes, displayEdges, navScopeKey, setNodes, setEdges]);
 
+  useEffect(() => {
+    diffCacheRef.current.clear();
+  }, [data.generated_at]);
+
+  const diffSelection = useMemo(
+    () => deriveDiffDockSelection(diffDock.response, activeDiffFile, activeDiffHunk),
+    [diffDock.response, activeDiffFile, activeDiffHunk]
+  );
+  const {
+    files: diffFiles,
+    activeFileIndex: safeActiveDiffFile,
+    activeFile: activeDiffFileDoc,
+    hunks: activeDiffHunks,
+    activeHunkIndex: safeActiveDiffHunk,
+    activeHunk: activeDiffHunkDoc,
+  } = diffSelection;
+
+  const resetDiffSelection = useCallback(() => {
+    setActiveDiffFile(0);
+    setActiveDiffHunk(0);
+  }, []);
+
   const onFlowInit = useCallback(
     (instance: ReactFlowInstance<Node, Edge>) => {
       flowRef.current = instance;
@@ -641,12 +931,103 @@ export function GraphView({ data, nav, onNavigate }: Props) {
     []
   );
 
+  const onNodeMouseEnter: NodeMouseHandler = useCallback(
+    (_event, node: Node) => {
+      const d = node.data as GraphNodeData;
+      const title = nodeDiffDockTitle(node, d);
+      const paths = normalizeDiffPaths(d.diffPaths);
+      resetDiffSelection();
+
+      if (paths.length === 0) {
+        setDiffDock(
+          buildDiffDockState({
+            title,
+            key: `none:${node.id}`,
+            paths: [],
+            noChanges: true,
+          })
+        );
+        return;
+      }
+
+      const cacheKey = paths.join("|");
+      const cached = diffCacheRef.current.get(cacheKey);
+      if (cached) {
+        setDiffDock(
+          buildDiffDockState({
+            title,
+            key: cacheKey,
+            paths,
+            response: cached,
+          })
+        );
+        return;
+      }
+
+      const requestId = ++hoverRequestRef.current;
+      setDiffDock(
+        buildDiffDockState({
+          title,
+          key: cacheKey,
+          paths,
+          loading: true,
+        })
+      );
+
+      void fetchDiff(paths)
+        .then((response) => {
+          diffCacheRef.current.set(cacheKey, response);
+          if (hoverRequestRef.current !== requestId) return;
+          setDiffDock(
+            buildDiffDockState({
+              title,
+              key: cacheKey,
+              paths,
+              response,
+            })
+          );
+        })
+        .catch((err) => {
+          if (hoverRequestRef.current !== requestId) return;
+          setDiffDock(
+            buildDiffDockState({
+              title,
+              key: cacheKey,
+              paths,
+              error: String(err),
+            })
+          );
+        });
+    },
+    [resetDiffSelection]
+  );
+
   const onNodeClick: NodeMouseHandler = useCallback(
     (event, node: Node) => {
       const d = node.data as GraphNodeData;
       const wantsNavigate = event.metaKey || event.ctrlKey || event.shiftKey;
       const isDeleted = d.gitStatus === "deleted";
       const markdownNav = markdownNavEntry(node, d);
+      const diffPaths = normalizeDiffPaths(d.diffPaths);
+
+      if (event.altKey && diffPaths.length > 0) {
+        onNavigate({
+          level: "diff",
+          label: `Diff: ${d.name || d.path || d.target || node.id}`,
+          id: `diff:${diffPaths.join("|")}`,
+          diff: {
+            seedPaths: diffPaths,
+            originScope: {
+              level: diffOriginLevel(nav.level),
+              label: nav.label,
+              id: nav.id,
+            },
+            maxHops: 2,
+            baseline: "head_worktree",
+          },
+        });
+        return;
+      }
 
       if (isDeleted && (node.type === "file" || node.type === "filegroup")) {
         return;
@@ -722,8 +1103,48 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         }
       }
     },
-    [onNavigate, relationFocusEnabled]
+    [onNavigate, relationFocusEnabled, nav]
   );
+
+  useEffect(() => {
+    if (!diffDock.open) return;
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (diffFiles.length === 0) return;
+
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        setActiveDiffFile((current) => Math.max(0, current - 1));
+        setActiveDiffHunk(0);
+        return;
+      }
+
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        setActiveDiffFile((current) => Math.min(diffFiles.length - 1, current + 1));
+        setActiveDiffHunk(0);
+        return;
+      }
+
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setActiveDiffHunk((current) => Math.max(0, current - 1));
+      } else if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setActiveDiffHunk((current) =>
+          Math.min(Math.max(0, activeDiffHunks.length - 1), current + 1)
+        );
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [diffDock.open, diffFiles.length, activeDiffHunks.length]);
+
+  const closeDiffDock = useCallback(() => {
+    setDiffDock((current) => ({ ...current, open: false }));
+  }, []);
 
   return (
     <div style={{ width: "100%", height: "100%" }}>
@@ -880,6 +1301,7 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         onNodesChange={onNodesChange}
         onEdgesChange={onEdgesChange}
         onNodeClick={onNodeClick}
+        onNodeMouseEnter={onNodeMouseEnter}
         onPaneClick={onPaneClick}
         onInit={onFlowInit}
         nodeTypes={nodeTypes}
@@ -893,47 +1315,41 @@ export function GraphView({ data, nav, onNavigate }: Props) {
           style: { stroke: graphColors.edgeStructure, strokeWidth: 1.5 },
         }}
       >
-        {cycleZones.length > 0 && (
-          <ViewportPortal>
-            <div className="cycle-zones-layer">
-              {cycleZones.map((zone) => (
-                <div
-                  key={zone.key}
-                  className="cycle-zone"
-                  style={{
-                    width: `${zone.width}px`,
-                    height: `${zone.height}px`,
-                    transform: `translate(${zone.x}px, ${zone.y}px)`,
-                  }}
-                >
-                  <div className="cycle-zone-label">
-                    {zone.label} <span>{zone.count}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </ViewportPortal>
+        {renderViewportZones(
+          diffBandZones,
+          "diff-bands-layer",
+          () => "diff-band-zone",
+          "diff-band-zone-label",
+          (zone) => zone.label
         )}
-        {folderZones.length > 0 && (
-          <ViewportPortal>
-            <div className="folder-zones-layer">
-              {folderZones.map((zone) => (
-                <div
-                  key={zone.key}
-                  className={`folder-zone folder-zone-depth-${Math.min(zone.depth, 3)}`}
-                  style={{
-                    width: `${zone.width}px`,
-                    height: `${zone.height}px`,
-                    transform: `translate(${zone.x}px, ${zone.y}px)`,
-                  }}
-                >
-                  <div className="folder-zone-label">
-                    {zone.label}/ <span>{zone.count}</span>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </ViewportPortal>
+        {renderViewportZones(
+          diffLaneZones,
+          "diff-lanes-layer",
+          () => "diff-lane-zone",
+          "diff-lane-zone-label",
+          (zone) => zone.label
+        )}
+        {renderViewportZones(
+          cycleZones,
+          "cycle-zones-layer",
+          () => "cycle-zone",
+          "cycle-zone-label",
+          (zone) => (
+            <>
+              {zone.label} <span>{zone.count}</span>
+            </>
+          )
+        )}
+        {renderViewportZones(
+          folderZones,
+          "folder-zones-layer",
+          (zone) => `folder-zone folder-zone-depth-${Math.min(zone.depth, 3)}`,
+          "folder-zone-label",
+          (zone) => (
+            <>
+              {zone.label}/ <span>{zone.count}</span>
+            </>
+          )
         )}
         <Background color={graphColors.grid} gap={20} />
         <Controls />
@@ -944,6 +1360,86 @@ export function GraphView({ data, nav, onNavigate }: Props) {
           style={{ background: graphColors.minimapBackground }}
         />
       </ReactFlow>
+      {diffDock.open && (
+        <aside className="diff-dock" aria-label="Diff dock">
+          <div className="diff-dock-header">
+            <div className="diff-dock-title">{diffDock.title}</div>
+            <button
+              type="button"
+              className="diff-dock-close"
+              onClick={closeDiffDock}
+            >
+              close
+            </button>
+          </div>
+          {diffDock.loading && <div className="diff-dock-loading">Loading diff…</div>}
+          {!diffDock.loading && diffDock.error && (
+            <div className="diff-dock-error">{diffDock.error}</div>
+          )}
+          {!diffDock.loading && !diffDock.error && diffDock.noChanges && (
+            <div className="diff-dock-empty">No changes for this node.</div>
+          )}
+          {!diffDock.loading && !diffDock.error && !diffDock.noChanges && (
+            <div className="diff-dock-body">
+              {diffDock.response?.truncated && (
+                <div className="diff-dock-warning">
+                  Diff output was truncated to keep rendering responsive.
+                </div>
+              )}
+              <div className="diff-dock-file-list">
+                {diffFiles.map((file, idx) => (
+                  <button
+                    key={file.path}
+                    type="button"
+                    className={`diff-dock-file ${idx === safeActiveDiffFile ? "is-active" : ""}`}
+                    onClick={() => {
+                      setActiveDiffFile(idx);
+                      setActiveDiffHunk(0);
+                    }}
+                  >
+                    <span className={`diff-dock-file-status is-${file.status}`}>{file.status}</span>
+                    <span className="diff-dock-file-path">{file.path}</span>
+                  </button>
+                ))}
+              </div>
+              {(() => {
+                if (diffFiles.length === 0 || !activeDiffFileDoc) {
+                  return <div className="diff-dock-empty">No diff content returned.</div>;
+                }
+                return (
+                  <div className="diff-dock-content">
+                    <div className="diff-dock-meta">
+                      <span>{activeDiffFileDoc.path}</span>
+                      {activeDiffFileDoc.truncated && (
+                        <span className="diff-dock-truncated-tag">file truncated</span>
+                      )}
+                      <span>
+                        hunk {activeDiffHunks.length === 0 ? 0 : safeActiveDiffHunk + 1}/
+                        {activeDiffHunks.length}
+                      </span>
+                    </div>
+                    {activeDiffHunkDoc ? (
+                      <div className="diff-dock-hunk">
+                        <div className="diff-dock-hunk-header">{activeDiffHunkDoc.header}</div>
+                        <div className="diff-dock-lines">
+                          {activeDiffHunkDoc.lines.map((line, idx) => (
+                            <div key={idx} className={`diff-dock-line is-${line.kind}`}>
+                              {line.text}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="diff-dock-empty">No hunks for this file.</div>
+                    )}
+                    <div className="diff-dock-hint">Left/Right files • Up/Down hunks</div>
+                  </div>
+                );
+              })()}
+            </div>
+          )}
+        </aside>
+      )}
     </div>
   );
 }

@@ -59,7 +59,20 @@ interface LayoutNodeData {
   hasChildren?: boolean;
   collapsedCount?: number;
   isSummary?: boolean;
+  diffHop?: number;
+  diffLane?: "group" | "module" | "file" | "tag";
+  hasChanges?: boolean;
+  name?: string;
 }
+
+const DIFF_LANE_ORDER = ["group", "module", "file", "tag"] as const;
+type DiffLaneKey = (typeof DIFF_LANE_ORDER)[number];
+const DIFF_LANE_X: Record<DiffLaneKey, number> = {
+  group: 80,
+  module: 760,
+  file: 1480,
+  tag: 2320,
+};
 
 interface DisjointSet {
   find: (key: string) => string;
@@ -180,6 +193,94 @@ export function estimateLayoutNodeSize(node: Node): LayoutNodeSize {
     width: estimateNodeWidth(node),
     height: estimateNodeHeight(node),
   };
+}
+
+function relationDegreeByNode(nodes: Node[], edges: Edge[]): Map<string, number> {
+  const valid = new Set(nodes.map((node) => node.id));
+  const degree = new Map<string, number>();
+  for (const edge of edges) {
+    if (!valid.has(edge.source) || !valid.has(edge.target)) continue;
+    degree.set(edge.source, (degree.get(edge.source) || 0) + 1);
+    degree.set(edge.target, (degree.get(edge.target) || 0) + 1);
+  }
+  return degree;
+}
+
+function laneRank(lane: string | undefined): number {
+  const idx = DIFF_LANE_ORDER.indexOf((lane || "file") as DiffLaneKey);
+  return idx >= 0 ? idx : DIFF_LANE_ORDER.length;
+}
+
+export function layoutDiffGraph(nodes: Node[], edges: Edge[]): Node[] {
+  if (nodes.length === 0) return nodes;
+  const degree = relationDegreeByNode(nodes, edges);
+  const sizeById = new Map<string, LayoutNodeSize>();
+  for (const node of nodes) {
+    sizeById.set(node.id, estimateLayoutNodeSize(node));
+  }
+
+  const buckets = new Map<string, Node[]>();
+  for (const node of nodes) {
+    const d = node.data as LayoutNodeData;
+    const hop = Math.max(0, Math.min(2, d.diffHop ?? 0));
+    const lane = d.diffLane || "file";
+    const key = `${hop}:${lane}`;
+    const list = buckets.get(key) || [];
+    list.push(node);
+    buckets.set(key, list);
+  }
+
+  for (const list of buckets.values()) {
+    list.sort((a, b) => {
+      const da = a.data as LayoutNodeData;
+      const db = b.data as LayoutNodeData;
+      const changedA = da.hasChanges ? 1 : 0;
+      const changedB = db.hasChanges ? 1 : 0;
+      if (changedA !== changedB) return changedB - changedA;
+
+      const degreeA = degree.get(a.id) || 0;
+      const degreeB = degree.get(b.id) || 0;
+      if (degreeA !== degreeB) return degreeB - degreeA;
+
+      const nameA = `${da.path || da.target || da.name || a.id}`;
+      const nameB = `${db.path || db.target || db.name || b.id}`;
+      return nameA.localeCompare(nameB);
+    });
+  }
+
+  const laneDefs = DIFF_LANE_ORDER.map((key) => ({ key, x: DIFF_LANE_X[key] }));
+
+  const placed = new Map<string, { x: number; y: number }>();
+  let bandY = 80;
+  for (let hop = 0; hop <= 2; hop += 1) {
+    let bandHeight = 280;
+    for (const laneDef of laneDefs) {
+      const key = `${hop}:${laneDef.key}`;
+      const laneNodes = buckets.get(key) || [];
+      let y = bandY + 52;
+      for (const node of laneNodes) {
+        const size = sizeById.get(node.id) || { width: DEFAULT_NODE_WIDTH, height: 220 };
+        placed.set(node.id, { x: laneDef.x, y });
+        y += size.height + 36;
+      }
+      bandHeight = Math.max(bandHeight, y - bandY);
+    }
+    bandY += bandHeight + 120;
+  }
+
+  return nodes
+    .slice()
+    .sort((a, b) => {
+      const da = a.data as LayoutNodeData;
+      const db = b.data as LayoutNodeData;
+      const laneDiff = laneRank(da.diffLane) - laneRank(db.diffLane);
+      if (laneDiff !== 0) return laneDiff;
+      return (da.diffHop || 0) - (db.diffHop || 0);
+    })
+    .map((node) => ({
+      ...node,
+      position: placed.get(node.id) || { x: 0, y: 0 },
+    }));
 }
 
 function buildSpacing(

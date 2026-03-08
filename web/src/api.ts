@@ -1,26 +1,58 @@
-import type { GraphData, MarkdownDoc } from "./types";
+import type { DiffBaseline, DiffResponse, GraphData, MarkdownDoc } from "./types";
 
 const API_BASE = "/api";
 const GRAPH_FETCH_TIMEOUT_MS = 15000;
+
+async function fetchJson<T>(url: string, init: RequestInit, errorPrefix: string): Promise<T> {
+  const response = await fetch(url, init);
+  if (!response.ok) {
+    throw new Error(`${errorPrefix}: ${response.status}`);
+  }
+  return response.json() as Promise<T>;
+}
 
 export async function fetchGraph(): Promise<GraphData> {
   const controller = new AbortController();
   const timeout = window.setTimeout(() => controller.abort(), GRAPH_FETCH_TIMEOUT_MS);
 
-  const r = await fetch(`${API_BASE}/graph`, { signal: controller.signal }).finally(() => {
+  try {
+    return await fetchJson<GraphData>(
+      `${API_BASE}/graph`,
+      { signal: controller.signal },
+      "Graph fetch failed"
+    );
+  } finally {
     window.clearTimeout(timeout);
-  });
-  if (!r.ok) throw new Error(`Graph fetch failed: ${r.status}`);
-  return r.json();
+  }
 }
 
 export async function fetchMarkdown(path: string): Promise<MarkdownDoc> {
   const query = new URLSearchParams({ path }).toString();
-  const response = await fetch(`${API_BASE}/markdown?${query}`);
-  if (!response.ok) {
-    throw new Error(`Markdown fetch failed: ${response.status}`);
-  }
-  return response.json();
+  return fetchJson<MarkdownDoc>(
+    `${API_BASE}/markdown?${query}`,
+    {},
+    "Markdown fetch failed"
+  );
+}
+
+export async function fetchDiff(
+  paths: string[],
+  baseline: DiffBaseline = "head_worktree"
+): Promise<DiffResponse> {
+  return fetchJson<DiffResponse>(
+    `${API_BASE}/diff`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        paths,
+        baseline,
+      }),
+    },
+    "Diff fetch failed"
+  );
 }
 
 export function subscribeToUpdates(onUpdate: () => void): () => void {
