@@ -66,6 +66,8 @@ interface EdgeData extends Record<string, unknown> {
   policyReason?: string[];
   parallelCentered?: number;
   parallelCount?: number;
+  collapsedLabels?: string[];
+  collapsedEdgeCount?: number;
 }
 
 interface WeightedDirectedEdge {
@@ -1643,13 +1645,8 @@ function separateParallelRelationEdges(edges: Edge[]): Edge[] {
       if (!edge) continue;
 
       const centered = lane - (group.length - 1) / 2;
-      const labelShift = Math.round(centered * 6);
       next[edgeIndex] = {
         ...edge,
-        labelStyle: {
-          ...(edge.labelStyle || {}),
-          transform: `translate(0px, ${labelShift}px)`,
-        },
         data: {
           ...((edge.data as EdgeData | undefined) || {}),
           parallelCentered: centered,
@@ -1660,6 +1657,83 @@ function separateParallelRelationEdges(edges: Edge[]): Edge[] {
   }
 
   return next;
+}
+
+function collapseParallelRelationEdges(edges: Edge[]): Edge[] {
+  const relationGroups = new Map<string, Edge[]>();
+  const passthrough: Edge[] = [];
+
+  for (const edge of edges) {
+    const data = edge.data as EdgeData | undefined;
+    if (data?.kind !== "relationship") {
+      passthrough.push(edge);
+      continue;
+    }
+
+    const evidenceSet = edgeEvidence(data);
+    const hasStatic = evidenceSet.has("static");
+    const hasSemantic = evidenceSet.has("semantic");
+    const relationType = data?.ambiguous
+      ? "ambiguous"
+      : hasStatic && hasSemantic
+        ? "blended"
+        : hasStatic
+          ? "static"
+          : "semantic";
+    const key = `${edge.source}->${edge.target}|${relationType}`;
+    const bucket = relationGroups.get(key) || [];
+    bucket.push(edge);
+    relationGroups.set(key, bucket);
+  }
+
+  const collapsed: Edge[] = [];
+  for (const bucket of relationGroups.values()) {
+    if (bucket.length === 0) continue;
+    if (bucket.length === 1) {
+      collapsed.push(bucket[0]);
+      continue;
+    }
+
+    const base = bucket[0];
+    const baseData = (base.data as EdgeData | undefined) || {};
+    const mergedEvidence = new Set<string>();
+    const labels: string[] = [];
+    const seenLabels = new Set<string>();
+
+    for (const edge of bucket) {
+      const data = (edge.data as EdgeData | undefined) || {};
+      for (const evidence of edgeEvidence(data)) {
+        mergedEvidence.add(evidence);
+      }
+
+      const text = typeof edge.label === "string" ? edge.label.trim() : "";
+      if (!text) continue;
+      const norm = text.toLowerCase();
+      if (seenLabels.has(norm)) continue;
+      seenLabels.add(norm);
+      labels.push(text);
+    }
+
+    const summaryLabel =
+      labels.length <= 1
+        ? labels[0] || (typeof base.label === "string" ? base.label : "")
+        : `${labels[0]} (+${labels.length - 1})`;
+
+    collapsed.push({
+      ...base,
+      id: `e-rel-collapsed-${base.source}-${base.target}-${collapsed.length}`,
+      animated: bucket.some((edge) => !!edge.animated),
+      label: summaryLabel || undefined,
+      data: {
+        ...baseData,
+        evidence: [...mergedEvidence],
+        collapsedLabels: labels,
+        collapsedEdgeCount: bucket.length,
+      },
+    });
+  }
+
+  return [...passthrough, ...collapsed];
 }
 
 export function transformGraph(
@@ -1675,7 +1749,8 @@ export function transformGraph(
 
   if (result.nodes.length > 0) {
     const withStatic = addStaticRelationships(data, nav, result.nodes, result.edges);
-    const withBackbone = addGeneratedLayoutBackbone(result.nodes, withStatic);
+    const withCollapsedParallels = collapseParallelRelationEdges(withStatic);
+    const withBackbone = addGeneratedLayoutBackbone(result.nodes, withCollapsedParallels);
     const withPolicy = applyConnectivityPolicy(result.nodes, withBackbone, nav);
     result = {
       nodes: result.nodes,

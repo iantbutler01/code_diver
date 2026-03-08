@@ -35,7 +35,7 @@
   --color-edge-focus-static: #93c5fd;
   --color-edge-blended: #10b981;
   --color-edge-focus-blended: #34d399;
-  --color-edge-ambiguous: #f59e0b;
+  --color-edge-ambiguous: #fb7185;
 
   --color-warning: #f59e0b;
   --color-warning-soft: rgba(245, 158, 11, 0.12);
@@ -266,11 +266,51 @@ body {
   border-color: var(--color-edge-blended);
 }
 
+.graph-legend-line.is-ambiguous {
+  border-color: var(--color-edge-ambiguous);
+}
+
 .folder-zones-layer {
   position: absolute;
   inset: 0;
   pointer-events: none;
   z-index: 1;
+}
+
+.cycle-zones-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 2;
+}
+
+.cycle-zone {
+  position: absolute;
+  border: 2px dashed rgba(245, 158, 11, 0.75);
+  border-radius: 16px;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px rgba(245, 158, 11, 0.2);
+}
+
+.cycle-zone-label {
+  position: absolute;
+  top: -10px;
+  right: 10px;
+  font-size: 0.64rem;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  color: #fcd34d;
+  font-weight: 700;
+  background: #111827;
+  border: 1px solid rgba(245, 158, 11, 0.45);
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.cycle-zone-label span {
+  color: #fde68a;
+  font-weight: 600;
+  text-transform: none;
 }
 
 .folder-zone {
@@ -902,6 +942,37 @@ body {
 .react-flow__edge-text {
   fill: var(--muted);
   font-size: 11px;
+}
+
+.edge-meta-label {
+  position: absolute;
+  pointer-events: none;
+  min-width: 140px;
+  max-width: 360px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.92);
+  padding: 3px 8px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.25;
+  box-shadow: 0 1px 6px rgba(0, 0, 0, 0.18);
+}
+
+.edge-meta-label-item {
+  white-space: normal;
+  word-break: break-word;
+}
+
+.edge-meta-label-item + .edge-meta-label-item {
+  margin-top: 2px;
+  padding-top: 2px;
+  border-top: 1px dashed rgba(148, 163, 184, 0.25);
+}
+
+.edge-meta-label-more {
+  font-style: italic;
+  color: var(--color-text-secondary);
 }
 
 .react-flow__controls {

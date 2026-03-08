@@ -1,7 +1,9 @@
-import { BaseEdge, getSmoothStepPath, type EdgeProps } from "@xyflow/react";
+import { BaseEdge, EdgeLabelRenderer, getSmoothStepPath, type EdgeProps } from "@xyflow/react";
 
 interface RelationEdgeData {
   parallelCentered?: number;
+  collapsedLabels?: string[];
+  collapsedEdgeCount?: number;
 }
 
 export function RelationEdge({
@@ -16,11 +18,6 @@ export function RelationEdge({
   markerStart,
   style,
   label,
-  labelStyle,
-  labelShowBg,
-  labelBgStyle,
-  labelBgPadding,
-  labelBgBorderRadius,
   interactionWidth,
   data,
 }: EdgeProps) {
@@ -64,23 +61,45 @@ export function RelationEdge({
     labelY = ly;
   }
 
+  const labels = (() => {
+    const fromData = Array.isArray(edgeData.collapsedLabels)
+      ? edgeData.collapsedLabels
+          .map((item) => (typeof item === "string" ? item.trim() : ""))
+          .filter(Boolean)
+      : [];
+    if (fromData.length > 0) return fromData;
+    const raw = typeof label === "string" ? label.trim() : "";
+    return raw ? [raw] : [];
+  })();
+
+  const labelOffsetY = centered * 9;
+
   return (
-    <BaseEdge
-      id={id}
-      path={edgePath}
-      markerEnd={markerEnd}
-      markerStart={markerStart}
-      style={style}
-      label={label}
-      labelX={labelX}
-      labelY={labelY}
-      labelStyle={labelStyle}
-      labelShowBg={labelShowBg}
-      labelBgStyle={labelBgStyle}
-      labelBgPadding={labelBgPadding}
-      labelBgBorderRadius={labelBgBorderRadius}
-      interactionWidth={interactionWidth}
-    />
+    <>
+      <BaseEdge
+        id={id}
+        path={edgePath}
+        markerEnd={markerEnd}
+        markerStart={markerStart}
+        style={style}
+        interactionWidth={interactionWidth}
+      />
+      {labels.length > 0 && (
+        <EdgeLabelRenderer>
+          <div
+            className="edge-meta-label"
+            style={{
+              transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY + labelOffsetY}px)`,
+            }}
+          >
+            {labels.map((item, idx) => (
+              <div key={`${id}:${idx}`} className="edge-meta-label-item">
+                {item}
+              </div>
+            ))}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
   );
 }
-

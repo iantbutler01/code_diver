@@ -90,6 +90,16 @@ interface FolderZone {
   height: number;
 }
 
+interface CycleZone {
+  key: string;
+  label: string;
+  count: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 function normalizePath(value: string): string {
   return value
     .trim()
@@ -221,6 +231,127 @@ function buildFolderZones(nodes: Node[]): FolderZone[] {
       return a.label.localeCompare(b.label);
     })
     .slice(0, 28);
+}
+
+function buildCycleZones(nodes: Node[], edges: Edge[]): CycleZone[] {
+  const relationEdges = edges.filter((edge) => {
+    const data = edge.data as EdgeData | undefined;
+    return data?.kind === "relationship" && !edge.hidden;
+  });
+  if (relationEdges.length === 0) return [];
+
+  const nodeById = new Map<string, Node>();
+  for (const node of nodes) {
+    nodeById.set(node.id, node);
+  }
+
+  const adjacency = new Map<string, Set<string>>();
+  const activeNodes = new Set<string>();
+  for (const edge of relationEdges) {
+    if (!nodeById.has(edge.source) || !nodeById.has(edge.target)) continue;
+    activeNodes.add(edge.source);
+    activeNodes.add(edge.target);
+    const set = adjacency.get(edge.source) || new Set<string>();
+    set.add(edge.target);
+    adjacency.set(edge.source, set);
+  }
+  if (activeNodes.size < 3) return [];
+
+  let index = 0;
+  const stack: string[] = [];
+  const onStack = new Set<string>();
+  const indexByNode = new Map<string, number>();
+  const lowByNode = new Map<string, number>();
+  const sccs: string[][] = [];
+
+  const strongConnect = (nodeId: string) => {
+    indexByNode.set(nodeId, index);
+    lowByNode.set(nodeId, index);
+    index += 1;
+    stack.push(nodeId);
+    onStack.add(nodeId);
+
+    const neighbors = adjacency.get(nodeId) || new Set<string>();
+    for (const neighbor of neighbors) {
+      if (!indexByNode.has(neighbor)) {
+        strongConnect(neighbor);
+        const low = Math.min(lowByNode.get(nodeId) || 0, lowByNode.get(neighbor) || 0);
+        lowByNode.set(nodeId, low);
+      } else if (onStack.has(neighbor)) {
+        const low = Math.min(lowByNode.get(nodeId) || 0, indexByNode.get(neighbor) || 0);
+        lowByNode.set(nodeId, low);
+      }
+    }
+
+    if ((lowByNode.get(nodeId) || 0) === (indexByNode.get(nodeId) || 0)) {
+      const component: string[] = [];
+      while (stack.length > 0) {
+        const member = stack.pop();
+        if (!member) break;
+        onStack.delete(member);
+        component.push(member);
+        if (member === nodeId) break;
+      }
+      if (component.length > 0) sccs.push(component);
+    }
+  };
+
+  const sortedNodes = [...activeNodes].sort((a, b) => a.localeCompare(b));
+  for (const nodeId of sortedNodes) {
+    if (!indexByNode.has(nodeId)) {
+      strongConnect(nodeId);
+    }
+  }
+
+  const cyclic = sccs.filter((component) => component.length >= 3);
+  if (cyclic.length === 0) return [];
+
+  const zones: CycleZone[] = [];
+  let cycleIndex = 0;
+  for (const component of cyclic) {
+    let minX = Number.POSITIVE_INFINITY;
+    let minY = Number.POSITIVE_INFINITY;
+    let maxX = Number.NEGATIVE_INFINITY;
+    let maxY = Number.NEGATIVE_INFINITY;
+
+    for (const nodeId of component) {
+      const node = nodeById.get(nodeId);
+      if (!node) continue;
+      const size = estimateLayoutNodeSize(node);
+      const x1 = node.position.x;
+      const y1 = node.position.y;
+      const x2 = x1 + size.width;
+      const y2 = y1 + size.height;
+      minX = Math.min(minX, x1);
+      minY = Math.min(minY, y1);
+      maxX = Math.max(maxX, x2);
+      maxY = Math.max(maxY, y2);
+    }
+
+    if (!Number.isFinite(minX) || !Number.isFinite(minY) || !Number.isFinite(maxX) || !Number.isFinite(maxY)) {
+      continue;
+    }
+
+    const padX = 26;
+    const padY = 24;
+    cycleIndex += 1;
+    zones.push({
+      key: `cycle:${component.slice().sort().join("|")}`,
+      label: `cycle ${cycleIndex}`,
+      count: component.length,
+      x: minX - padX,
+      y: minY - padY,
+      width: maxX - minX + padX * 2,
+      height: maxY - minY + padY * 2,
+    });
+  }
+
+  return zones
+    .sort((a, b) => {
+      if (b.count !== a.count) return b.count - a.count;
+      return a.label.localeCompare(b.label);
+    })
+    .slice(0, 16);
 }
 
 function isMarkdownPath(path: string | null | undefined): boolean {
@@ -367,6 +498,7 @@ export function GraphView({ data, nav, onNavigate }: Props) {
   const [relationFocusOverride, setRelationFocusOverride] = useState<boolean | null>(null);
   const [focusedNodeId, setFocusedNodeId] = useState<string | null>(null);
   const [folderZonesEnabled, setFolderZonesEnabled] = useState(true);
+  const [cycleZonesEnabled, setCycleZonesEnabled] = useState(true);
   const flowRef = useRef<ReactFlowInstance<Node, Edge> | null>(null);
   const pendingFitScopeRef = useRef<string | null>(null);
 
@@ -436,6 +568,12 @@ export function GraphView({ data, nav, onNavigate }: Props) {
     if (nav.level === "file") return [];
     return buildFolderZones(enrichedLayoutNodes);
   }, [enrichedLayoutNodes, nav.level, folderZonesEnabled]);
+
+  const cycleZones = useMemo(() => {
+    if (!cycleZonesEnabled) return [];
+    if (nav.level === "file") return [];
+    return buildCycleZones(enrichedLayoutNodes, layoutEdges);
+  }, [enrichedLayoutNodes, layoutEdges, nav.level, cycleZonesEnabled]);
 
   const { nodes: displayNodes, edges: displayEdges } = useMemo(
     () =>
@@ -603,6 +741,13 @@ export function GraphView({ data, nav, onNavigate }: Props) {
         >
           {relationFocusEnabled ? "Relation Focus: ON" : "Relation Focus: OFF"}
         </button>
+        <button
+          type="button"
+          className={`graph-toolbar-button ${cycleZonesEnabled ? "is-active" : ""}`}
+          onClick={() => setCycleZonesEnabled((value) => !value)}
+        >
+          {cycleZonesEnabled ? "Cycle Clusters: ON" : "Cycle Clusters: OFF"}
+        </button>
         {relationPolicyStats.total > 0 && (
           <span className="graph-toolbar-hint">
             policy: showing {relationPolicyStats.selected}/{relationPolicyStats.total} relations
@@ -655,8 +800,12 @@ export function GraphView({ data, nav, onNavigate }: Props) {
           blended rel
         </span>
         <span className="graph-legend-item">
+          <span className="graph-legend-line is-ambiguous" />
+          ambiguous rel
+        </span>
+        <span className="graph-legend-item">
           <span className="graph-legend-dot is-warning" />
-          ambiguity/warning
+          warning
         </span>
       </div>
       <ReactFlow
@@ -678,6 +827,27 @@ export function GraphView({ data, nav, onNavigate }: Props) {
           style: { stroke: graphColors.edgeStructure, strokeWidth: 1.5 },
         }}
       >
+        {cycleZones.length > 0 && (
+          <ViewportPortal>
+            <div className="cycle-zones-layer">
+              {cycleZones.map((zone) => (
+                <div
+                  key={zone.key}
+                  className="cycle-zone"
+                  style={{
+                    width: `${zone.width}px`,
+                    height: `${zone.height}px`,
+                    transform: `translate(${zone.x}px, ${zone.y}px)`,
+                  }}
+                >
+                  <div className="cycle-zone-label">
+                    {zone.label} <span>{zone.count}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </ViewportPortal>
+        )}
         {folderZones.length > 0 && (
           <ViewportPortal>
             <div className="folder-zones-layer">
