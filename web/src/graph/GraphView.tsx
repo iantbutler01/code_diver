@@ -509,15 +509,7 @@ export function GraphView({ data, nav, onNavigate }: Props) {
   const { layoutNodes, layoutEdges } = useMemo(() => {
     try {
       const { nodes, edges } = transformGraph(data, nav);
-      const relationCount = edges.filter(
-        (edge) => (edge.data as EdgeData | undefined)?.kind === "relationship"
-      ).length;
-      const structuralCount = edges.filter(
-        (edge) => (edge.data as EdgeData | undefined)?.layout !== false
-      ).length;
-      const layoutDirection =
-        nav.level === "system" || relationCount > structuralCount ? "LR" : "TB";
-      const positioned = layoutGraph(nodes, edges, layoutDirection);
+      const positioned = layoutGraph(nodes, edges);
       return { layoutNodes: positioned, layoutEdges: edges };
     } catch (err) {
       console.error("[graph] layout failed; using fallback positioning", err);

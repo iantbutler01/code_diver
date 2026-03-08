@@ -30,6 +30,11 @@ interface EdgeData {
   kind?: string;
   layout?: boolean;
   bundledCount?: number;
+  evidence?: string[];
+  ambiguous?: boolean;
+  staticConfidence?: number;
+  policySelected?: boolean;
+  policySuppressed?: boolean;
 }
 
 interface LayoutConcept {
@@ -307,10 +312,46 @@ function resolveCollisions(
   return out;
 }
 
+interface WeightedLayoutEdge {
+  source: string;
+  target: string;
+  weight: number;
+  structural: boolean;
+}
+
+interface LayoutBounds {
+  minX: number;
+  minY: number;
+  maxX: number;
+  maxY: number;
+  width: number;
+  height: number;
+}
+
+function edgeEvidenceSet(data: EdgeData | undefined): Set<string> {
+  const raw = Array.isArray(data?.evidence) ? data.evidence : [];
+  return new Set(raw.filter((value): value is string => typeof value === "string"));
+}
+
 function relationEdgeWeight(edge: Edge): number {
   const data = edge.data as EdgeData | undefined;
   const bundled = typeof data?.bundledCount === "number" ? data.bundledCount : 1;
-  return Math.max(1, bundled);
+  const evidence = edgeEvidenceSet(data);
+  const hasStatic = evidence.has("static");
+  const hasSemantic = evidence.has("semantic") || evidence.size === 0;
+
+  let score = Math.max(1, bundled) * 0.9;
+  if (hasSemantic) score += 1.5;
+  if (hasStatic) score += 0.55;
+  if (hasStatic && hasSemantic) score += 0.8;
+  if (data?.policySelected) score += 0.45;
+  if (data?.policySuppressed) score -= 0.6;
+  if (typeof data?.staticConfidence === "number") {
+    score += Math.max(0, Math.min(1, data.staticConfidence)) * 0.8;
+  }
+  if (data?.ambiguous) score -= 0.2;
+
+  return Number(Math.max(0.5, Math.min(9, score)).toFixed(3));
 }
 
 function createDisjointSet(keys: string[]): DisjointSet {
@@ -341,166 +382,328 @@ function createDisjointSet(keys: string[]): DisjointSet {
   return { find, union };
 }
 
-function selectRelationLayoutEdges(nodes: Node[], relationEdges: Edge[]): Edge[] {
-  if (relationEdges.length === 0) return [];
-
+function collectBlendedLayoutEdges(nodes: Node[], edges: Edge[]): WeightedLayoutEdge[] {
   const nodeIds = new Set(nodes.map((node) => node.id));
-  const dedup = new Map<string, Edge>();
-  const weightByKey = new Map<string, number>();
+  const dedup = new Map<string, WeightedLayoutEdge>();
 
-  for (const edge of relationEdges) {
+  for (const edge of edges) {
     if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) continue;
     if (edge.source === edge.target) continue;
 
+    const data = edge.data as EdgeData | undefined;
+    const isStructure = data?.layout !== false;
+    const isRelationship = data?.kind === "relationship";
+    if (!isStructure && !isRelationship) continue;
+
+    // Suppressed relationship overlays should not drive rank.
+    if (isRelationship && (edge.hidden || data?.policySuppressed)) continue;
+
     const key = `${edge.source}->${edge.target}`;
-    const weight = relationEdgeWeight(edge);
-    const currentWeight = weightByKey.get(key) || 0;
-    if (!dedup.has(key) || weight > currentWeight) {
-      dedup.set(key, edge);
-      weightByKey.set(key, weight);
+    const nextWeight = isStructure ? 6 : relationEdgeWeight(edge);
+    const existing = dedup.get(key);
+    if (!existing) {
+      dedup.set(key, {
+        source: edge.source,
+        target: edge.target,
+        weight: nextWeight,
+        structural: isStructure,
+      });
+      continue;
     }
+
+    const mergedStructural = existing.structural || isStructure;
+    let mergedWeight = Math.max(existing.weight, nextWeight);
+    if (existing.structural !== isStructure) {
+      mergedWeight += 1.4;
+    }
+
+    dedup.set(key, {
+      source: edge.source,
+      target: edge.target,
+      weight: Number(Math.min(10, mergedWeight).toFixed(3)),
+      structural: mergedStructural,
+    });
   }
 
-  const candidates = [...dedup.values()];
-  if (candidates.length === 0) return [];
+  return [...dedup.values()];
+}
+
+function selectBlendedRankEdges(
+  nodeIds: string[],
+  allEdges: WeightedLayoutEdge[]
+): WeightedLayoutEdge[] {
+  if (allEdges.length === 0 || nodeIds.length < 2) return allEdges;
 
   const maxEdges = Math.min(
-    candidates.length,
-    Math.max(nodes.length - 1, Math.ceil(nodes.length * 1.4))
+    allEdges.length,
+    Math.max(nodeIds.length - 1, Math.ceil(nodeIds.length * 2.4))
   );
-  if (candidates.length <= maxEdges) return candidates;
+  if (allEdges.length <= maxEdges) return allEdges;
 
-  const outDegree = new Map<string, number>();
-  const inDegree = new Map<string, number>();
-  for (const edge of candidates) {
-    outDegree.set(edge.source, (outDegree.get(edge.source) || 0) + 1);
-    inDegree.set(edge.target, (inDegree.get(edge.target) || 0) + 1);
+  const weightedOut = new Map<string, number>();
+  const weightedIn = new Map<string, number>();
+  for (const edge of allEdges) {
+    weightedOut.set(edge.source, (weightedOut.get(edge.source) || 0) + edge.weight);
+    weightedIn.set(edge.target, (weightedIn.get(edge.target) || 0) + edge.weight);
   }
 
-  const ranked = [...candidates].sort((a, b) => {
+  const ranked = [...allEdges].sort((a, b) => {
     const scoreA =
-      relationEdgeWeight(a) * 2 +
-      (outDegree.get(a.source) || 0) +
-      (inDegree.get(a.target) || 0);
+      a.weight * 2.2 +
+      (weightedOut.get(a.source) || 0) * 0.24 +
+      (weightedIn.get(a.target) || 0) * 0.24;
     const scoreB =
-      relationEdgeWeight(b) * 2 +
-      (outDegree.get(b.source) || 0) +
-      (inDegree.get(b.target) || 0);
-    return scoreB - scoreA;
+      b.weight * 2.2 +
+      (weightedOut.get(b.source) || 0) * 0.24 +
+      (weightedIn.get(b.target) || 0) * 0.24;
+    if (scoreA !== scoreB) return scoreB - scoreA;
+    return `${a.source}->${a.target}`.localeCompare(`${b.source}->${b.target}`);
   });
 
-  const maxPerNode = 2;
-  const selected: Edge[] = [];
+  const selected: WeightedLayoutEdge[] = [];
   const selectedKeys = new Set<string>();
-  const usedOut = new Map<string, number>();
-  const usedIn = new Map<string, number>();
-  const coveredNodes = new Set<string>();
-  const dsu = createDisjointSet(nodes.map((node) => node.id));
+  const incident = new Map<string, number>();
+  const dsu = createDisjointSet(nodeIds);
+  const nodeSet = new Set(nodeIds);
 
-  const edgeKey = (edge: Edge) => `${edge.source}->${edge.target}`;
-
-  const addSelected = (edge: Edge) => {
+  const keyOf = (edge: WeightedLayoutEdge) => `${edge.source}->${edge.target}`;
+  const add = (edge: WeightedLayoutEdge) => {
     selected.push(edge);
-    selectedKeys.add(edgeKey(edge));
-    usedOut.set(edge.source, (usedOut.get(edge.source) || 0) + 1);
-    usedIn.set(edge.target, (usedIn.get(edge.target) || 0) + 1);
-    coveredNodes.add(edge.source);
-    coveredNodes.add(edge.target);
+    selectedKeys.add(keyOf(edge));
+    incident.set(edge.source, (incident.get(edge.source) || 0) + 1);
+    incident.set(edge.target, (incident.get(edge.target) || 0) + 1);
   };
 
-  // Phase 1: build a sparse backbone that connects components with minimal cycles.
+  // Phase 1: strongest forest to keep global flow coherent.
   for (const edge of ranked) {
     if (selected.length >= maxEdges) break;
-    if ((usedOut.get(edge.source) || 0) >= 1) continue;
-    if ((usedIn.get(edge.target) || 0) >= 1) continue;
     if (dsu.find(edge.source) === dsu.find(edge.target)) continue;
-
-    addSelected(edge);
+    add(edge);
     dsu.union(edge.source, edge.target);
   }
 
-  // Phase 2: ensure isolated nodes get at least one relation in layout.
-  for (const edge of ranked) {
+  // Phase 2: ensure every visible node gets at least one rank-driving edge when possible.
+  for (const nodeId of nodeSet) {
     if (selected.length >= maxEdges) break;
-    if (selectedKeys.has(edgeKey(edge))) continue;
-    if (coveredNodes.has(edge.source) && coveredNodes.has(edge.target)) continue;
-    if ((usedOut.get(edge.source) || 0) >= maxPerNode) continue;
-    if ((usedIn.get(edge.target) || 0) >= maxPerNode) continue;
-    addSelected(edge);
+    if ((incident.get(nodeId) || 0) > 0) continue;
+
+    const candidate = ranked.find(
+      (edge) =>
+        !selectedKeys.has(keyOf(edge)) && (edge.source === nodeId || edge.target === nodeId)
+    );
+    if (!candidate) continue;
+    add(candidate);
   }
 
-  // Phase 3: add a few strong extra edges to retain directional flow cues.
+  // Phase 3: add directional cues while avoiding hub over-saturation.
+  const maxIncident = Math.max(3, Math.ceil(maxEdges / Math.max(1, nodeIds.length)) + 2);
   for (const edge of ranked) {
     if (selected.length >= maxEdges) break;
-    if (selectedKeys.has(edgeKey(edge))) continue;
-    if ((usedOut.get(edge.source) || 0) >= maxPerNode) continue;
-    if ((usedIn.get(edge.target) || 0) >= maxPerNode) continue;
-    addSelected(edge);
+    if (selectedKeys.has(keyOf(edge))) continue;
+    if ((incident.get(edge.source) || 0) >= maxIncident) continue;
+    if ((incident.get(edge.target) || 0) >= maxIncident) continue;
+    add(edge);
   }
 
   return selected;
 }
 
-export function layoutGraph(
-  nodes: Node[],
-  edges: Edge[],
-  direction: "TB" | "LR" = "TB"
-): Node[] {
-  if (nodes.length === 0) return nodes;
-
-  const structuralEdges = edges.filter((edge) => {
-    const data = edge.data as EdgeData | undefined;
-    return data?.layout !== false;
-  });
-
-  const relationEdges = edges.filter((edge) => {
-    const data = edge.data as EdgeData | undefined;
-    return data?.kind === "relationship";
-  });
-
-  // Relation-driven fallback can become expensive/noisy on large dense views.
-  // Keep it for small/medium graphs; otherwise rely on structural backbone or grid.
-  const canUseRelationDrivenFallback =
-    structuralEdges.length === 0 &&
-    relationEdges.length > 0 &&
-    nodes.length <= 80 &&
-    relationEdges.length <= 700;
-  const relationDriven = canUseRelationDrivenFallback;
-  const relationLayoutEdges = relationDriven
-    ? selectRelationLayoutEdges(nodes, relationEdges)
-    : [];
-  const layoutEdges = relationDriven ? relationLayoutEdges : structuralEdges;
-
-  if (layoutEdges.length === 0) {
-    return gridLayout(nodes);
+function stronglyConnectedComponents(
+  nodeIds: string[],
+  edges: WeightedLayoutEdge[]
+): string[][] {
+  const adjacency = new Map<string, string[]>();
+  const edgeSets = new Map<string, Set<string>>();
+  for (const nodeId of nodeIds) {
+    adjacency.set(nodeId, []);
+    edgeSets.set(nodeId, new Set<string>());
   }
 
-  const spacing = buildSpacing(nodes.length, layoutEdges.length, edges.length);
+  for (const edge of edges) {
+    const out = edgeSets.get(edge.source);
+    if (!out || out.has(edge.target)) continue;
+    out.add(edge.target);
+    adjacency.get(edge.source)?.push(edge.target);
+  }
+
+  const index = new Map<string, number>();
+  const lowlink = new Map<string, number>();
+  const onStack = new Set<string>();
+  const stack: string[] = [];
+  const components: string[][] = [];
+  let nextIndex = 0;
+
+  const visit = (nodeId: string) => {
+    index.set(nodeId, nextIndex);
+    lowlink.set(nodeId, nextIndex);
+    nextIndex += 1;
+    stack.push(nodeId);
+    onStack.add(nodeId);
+
+    const neighbors = adjacency.get(nodeId) || [];
+    for (const neighbor of neighbors) {
+      if (!index.has(neighbor)) {
+        visit(neighbor);
+        const min = Math.min(lowlink.get(nodeId) || 0, lowlink.get(neighbor) || 0);
+        lowlink.set(nodeId, min);
+      } else if (onStack.has(neighbor)) {
+        const min = Math.min(lowlink.get(nodeId) || 0, index.get(neighbor) || 0);
+        lowlink.set(nodeId, min);
+      }
+    }
+
+    if ((lowlink.get(nodeId) || 0) !== (index.get(nodeId) || 0)) return;
+
+    const component: string[] = [];
+    while (stack.length > 0) {
+      const current = stack.pop();
+      if (!current) break;
+      onStack.delete(current);
+      component.push(current);
+      if (current === nodeId) break;
+    }
+    component.sort((a, b) => a.localeCompare(b));
+    components.push(component);
+  };
+
+  const ordered = [...nodeIds].sort((a, b) => a.localeCompare(b));
+  for (const nodeId of ordered) {
+    if (index.has(nodeId)) continue;
+    visit(nodeId);
+  }
+
+  components.sort((a, b) => {
+    if (b.length !== a.length) return b.length - a.length;
+    return a[0].localeCompare(b[0]);
+  });
+
+  return components;
+}
+
+function estimateComponentFootprint(
+  memberIds: string[],
+  sizeById: Map<string, LayoutNodeSize>
+): LayoutNodeSize {
+  if (memberIds.length === 0) {
+    return { width: DEFAULT_NODE_WIDTH, height: 260 };
+  }
+
+  if (memberIds.length === 1) {
+    const single = sizeById.get(memberIds[0]) || {
+      width: DEFAULT_NODE_WIDTH,
+      height: 220,
+    };
+    return {
+      width: Math.round(single.width + 120),
+      height: Math.round(single.height + 120),
+    };
+  }
+
+  let totalWidth = 0;
+  let totalHeight = 0;
+  let maxWidth = 0;
+  let maxHeight = 0;
+  for (const id of memberIds) {
+    const size = sizeById.get(id) || { width: DEFAULT_NODE_WIDTH, height: 220 };
+    totalWidth += size.width;
+    totalHeight += size.height;
+    maxWidth = Math.max(maxWidth, size.width);
+    maxHeight = Math.max(maxHeight, size.height);
+  }
+
+  const avgWidth = totalWidth / memberIds.length;
+  const avgHeight = totalHeight / memberIds.length;
+  const cols = Math.max(2, Math.ceil(Math.sqrt(memberIds.length)));
+  const rows = Math.ceil(memberIds.length / cols);
+
+  return {
+    width: Math.round(
+      Math.min(4800, Math.max(maxWidth + 180, cols * (avgWidth + 86) + 180))
+    ),
+    height: Math.round(
+      Math.min(5200, Math.max(maxHeight + 180, rows * (avgHeight + 86) + 180))
+    ),
+  };
+}
+
+function computeBounds(entries: LayoutEntry[]): LayoutBounds {
+  if (entries.length === 0) {
+    return {
+      minX: 0,
+      minY: 0,
+      maxX: 0,
+      maxY: 0,
+      width: 0,
+      height: 0,
+    };
+  }
+
+  const minX = Math.min(...entries.map((entry) => entry.x));
+  const minY = Math.min(...entries.map((entry) => entry.y));
+  const maxX = Math.max(...entries.map((entry) => entry.x + entry.width));
+  const maxY = Math.max(...entries.map((entry) => entry.y + entry.height));
+
+  return {
+    minX,
+    minY,
+    maxX,
+    maxY,
+    width: maxX - minX,
+    height: maxY - minY,
+  };
+}
+
+function layoutSubgraph(
+  memberNodes: Node[],
+  memberEdges: WeightedLayoutEdge[],
+  sizeById: Map<string, LayoutNodeSize>,
+  nodesep: number,
+  ranksep: number,
+  marginx: number,
+  marginy: number
+): LayoutEntry[] {
+  if (memberNodes.length === 0) return [];
+
+  if (memberEdges.length === 0) {
+    const gridNodes = gridLayout(memberNodes);
+    return gridNodes.map((node) => {
+      const size = sizeById.get(node.id) || estimateLayoutNodeSize(node);
+      return {
+        node,
+        x: node.position.x,
+        y: node.position.y,
+        width: size.width,
+        height: size.height,
+      };
+    });
+  }
 
   const g = new dagre.graphlib.Graph();
   g.setDefaultEdgeLabel(() => ({}));
   g.setGraph({
-    rankdir: relationDriven ? "LR" : direction,
-    nodesep: spacing.nodesep,
-    ranksep: spacing.ranksep,
-    marginx: spacing.marginx,
-    marginy: spacing.marginy,
-    ranker: relationDriven ? "network-simplex" : "tight-tree",
+    rankdir: "TB",
+    nodesep,
+    ranksep,
+    marginx,
+    marginy,
+    ranker: "network-simplex",
     acyclicer: "greedy",
   });
 
-  for (const node of nodes) {
-    const size = estimateLayoutNodeSize(node);
+  for (const node of memberNodes) {
+    const size = sizeById.get(node.id) || estimateLayoutNodeSize(node);
     g.setNode(node.id, { width: size.width, height: size.height });
   }
 
-  for (const edge of layoutEdges) {
-    g.setEdge(edge.source, edge.target);
+  for (const edge of memberEdges) {
+    g.setEdge(edge.source, edge.target, {
+      weight: Math.max(1, Math.round(edge.weight * 3)),
+    });
   }
 
   dagre.layout(g);
 
-  const initial = nodes.map((node) => {
+  return memberNodes.map((node) => {
     const info = g.node(node.id);
     return {
       node,
@@ -510,13 +713,199 @@ export function layoutGraph(
       height: info.height,
     };
   });
+}
 
-  const spread = spreadFromCenter(initial, spacing.spreadScale);
+export function layoutGraph(nodes: Node[], edges: Edge[]): Node[] {
+  if (nodes.length === 0) return nodes;
+
+  const nodeIds = nodes.map((node) => node.id);
+  const blendedEdges = collectBlendedLayoutEdges(nodes, edges);
+  if (blendedEdges.length === 0) {
+    return gridLayout(nodes);
+  }
+
+  const rankEdges = selectBlendedRankEdges(nodeIds, blendedEdges);
+  if (rankEdges.length === 0) {
+    return gridLayout(nodes);
+  }
+
+  const spacing = buildSpacing(nodes.length, rankEdges.length, edges.length);
+  const rankDensity = rankEdges.length / Math.max(1, nodes.length);
+  const denseFactor = Math.max(0, Math.min(1, (rankDensity - 1.15) / 1.85));
+  const sizeById = new Map<string, LayoutNodeSize>();
+  const nodeById = new Map<string, Node>();
+  for (const node of nodes) {
+    sizeById.set(node.id, estimateLayoutNodeSize(node));
+    nodeById.set(node.id, node);
+  }
+
+  const components = stronglyConnectedComponents(nodeIds, blendedEdges);
+  const compByNodeId = new Map<string, number>();
+  for (let i = 0; i < components.length; i += 1) {
+    for (const nodeId of components[i]) {
+      compByNodeId.set(nodeId, i);
+    }
+  }
+
+  const internalRankEdgeCountByComponent = new Map<number, number>();
+  for (const edge of rankEdges) {
+    const sourceComp = compByNodeId.get(edge.source);
+    const targetComp = compByNodeId.get(edge.target);
+    if (sourceComp == null || targetComp == null || sourceComp !== targetComp) continue;
+    internalRankEdgeCountByComponent.set(
+      sourceComp,
+      (internalRankEdgeCountByComponent.get(sourceComp) || 0) + 1
+    );
+  }
+
+  const componentNodes = components.map((memberIds, index) => {
+    const footprint = estimateComponentFootprint(memberIds, sizeById);
+    const internalCount = internalRankEdgeCountByComponent.get(index) || 0;
+    const internalDensity = internalCount / Math.max(1, memberIds.length);
+    const densityScale =
+      1 + Math.min(0.65, denseFactor * 0.35 + Math.max(0, internalDensity - 1) * 0.12);
+    return {
+      id: `scc:${index}`,
+      width: Math.round(footprint.width * densityScale),
+      height: Math.round(footprint.height * densityScale),
+      memberIds,
+    };
+  });
+
+  const condensedEdges = new Map<string, WeightedLayoutEdge>();
+  for (const edge of rankEdges) {
+    const sourceComp = compByNodeId.get(edge.source);
+    const targetComp = compByNodeId.get(edge.target);
+    if (sourceComp == null || targetComp == null || sourceComp === targetComp) continue;
+    const key = `scc:${sourceComp}->scc:${targetComp}`;
+    const existing = condensedEdges.get(key);
+    if (!existing) {
+      condensedEdges.set(key, {
+        source: `scc:${sourceComp}`,
+        target: `scc:${targetComp}`,
+        weight: edge.weight,
+        structural: edge.structural,
+      });
+      continue;
+    }
+    condensedEdges.set(key, {
+      ...existing,
+      weight: existing.weight + edge.weight,
+      structural: existing.structural || edge.structural,
+    });
+  }
+
+  if (condensedEdges.size === 0 && componentNodes.length > 1) {
+    for (let i = 1; i < componentNodes.length; i += 1) {
+      condensedEdges.set(
+        `${componentNodes[i - 1].id}->${componentNodes[i].id}`,
+        {
+          source: componentNodes[i - 1].id,
+          target: componentNodes[i].id,
+          weight: 1,
+          structural: true,
+        }
+      );
+    }
+  }
+
+  const componentGraph = new dagre.graphlib.Graph();
+  componentGraph.setDefaultEdgeLabel(() => ({}));
+  componentGraph.setGraph({
+    rankdir: "TB",
+    nodesep: Math.round(spacing.nodesep * (1.16 + denseFactor * 0.28)),
+    ranksep: Math.round(spacing.ranksep * (1.34 + denseFactor * 0.34)),
+    marginx: Math.round(spacing.marginx * 1.1),
+    marginy: Math.round(spacing.marginy * 1.1),
+    ranker: "network-simplex",
+    acyclicer: "greedy",
+  });
+
+  for (const comp of componentNodes) {
+    componentGraph.setNode(comp.id, { width: comp.width, height: comp.height });
+  }
+  for (const edge of condensedEdges.values()) {
+    componentGraph.setEdge(edge.source, edge.target, {
+      weight: Math.max(1, Math.round(edge.weight * 2)),
+    });
+  }
+
+  dagre.layout(componentGraph);
+
+  const internalEdgesByComponent = new Map<number, WeightedLayoutEdge[]>();
+  for (const edge of rankEdges) {
+    const sourceComp = compByNodeId.get(edge.source);
+    const targetComp = compByNodeId.get(edge.target);
+    if (sourceComp == null || targetComp == null || sourceComp !== targetComp) continue;
+    const existing = internalEdgesByComponent.get(sourceComp) || [];
+    existing.push(edge);
+    internalEdgesByComponent.set(sourceComp, existing);
+  }
+
+  const fewSuperNodes = componentNodes.length <= 2;
+  const localSepScale = Math.min(1.24, 0.72 + denseFactor * 0.42 + (fewSuperNodes ? 0.18 : 0));
+  const localRankScale = Math.min(1.32, 0.76 + denseFactor * 0.46 + (fewSuperNodes ? 0.22 : 0));
+  const localSpreadExtra = Math.min(0.12, denseFactor * 0.08 + (fewSuperNodes ? 0.03 : 0));
+  const localGapScale = Math.min(1.0, 0.56 + denseFactor * 0.34 + (fewSuperNodes ? 0.12 : 0));
+
+  const placed: LayoutEntry[] = [];
+  for (let compIndex = 0; compIndex < componentNodes.length; compIndex += 1) {
+    const comp = componentNodes[compIndex];
+    const memberNodes: Node[] = comp.memberIds
+      .map((nodeId) => nodeById.get(nodeId))
+      .filter((node): node is Node => !!node);
+    if (memberNodes.length === 0) continue;
+
+    const localNodes = layoutSubgraph(
+      memberNodes,
+      internalEdgesByComponent.get(compIndex) || [],
+      sizeById,
+      Math.max(86, Math.round(spacing.nodesep * localSepScale)),
+      Math.max(104, Math.round(spacing.ranksep * localRankScale)),
+      28,
+      28
+    );
+    const localSpread = spreadFromCenter(
+      localNodes,
+      1 + (spacing.spreadScale - 1) * 0.55 + localSpreadExtra
+    );
+    const localSeparated = resolveCollisions(
+      localSpread,
+      "TB",
+      Math.max(24, Math.round(spacing.collisionGapX * localGapScale)),
+      Math.max(18, Math.round(spacing.collisionGapY * localGapScale))
+    );
+    const bounds = computeBounds(localSeparated);
+
+    const info = componentGraph.node(comp.id);
+    const anchorX = info.x;
+    const anchorY = info.y;
+    const centerX = bounds.minX + bounds.width / 2;
+    const centerY = bounds.minY + bounds.height / 2;
+    const shiftX = anchorX - centerX;
+    const shiftY = anchorY - centerY;
+
+    for (const entry of localSeparated) {
+      placed.push({
+        ...entry,
+        x: entry.x + shiftX,
+        y: entry.y + shiftY,
+      });
+    }
+  }
+
+  if (placed.length === 0) return gridLayout(nodes);
+
+  const finalGapScale = Math.min(1.08, 0.72 + denseFactor * 0.28 + (fewSuperNodes ? 0.08 : 0));
+  const compactSpread = spreadFromCenter(
+    placed,
+    1 + (spacing.spreadScale - 1) * (0.44 + denseFactor * 0.75) + localSpreadExtra * 0.35
+  );
   const separated = resolveCollisions(
-    spread,
-    relationDriven ? "LR" : direction,
-    spacing.collisionGapX,
-    spacing.collisionGapY
+    compactSpread,
+    "TB",
+    Math.max(28, Math.round(spacing.collisionGapX * finalGapScale)),
+    Math.max(22, Math.round(spacing.collisionGapY * finalGapScale))
   );
 
   return separated.map((entry) => ({

@@ -912,8 +912,19 @@ body {
   z-index: 20 !important;
 }
 
+.react-flow__edge,
+.react-flow__connection,
+.react-flow__connectionline {
+  z-index: 20 !important;
+}
+
 .react-flow__edge-labels {
-  z-index: 22 !important;
+  z-index: 35 !important;
+}
+
+.react-flow__edge-label-renderer,
+.react-flow__edgelabel-renderer {
+  z-index: 35 !important;
 }
 
 .react-flow__nodes {
@@ -947,11 +958,12 @@ body {
 .edge-meta-label {
   position: absolute;
   pointer-events: none;
+  z-index: 36;
   min-width: 140px;
   max-width: 360px;
   border: 1px solid var(--line);
   border-radius: 6px;
-  background: rgba(15, 23, 42, 0.92);
+  background: #0f172a;
   padding: 3px 8px;
   color: var(--muted);
   font-size: 11px;
