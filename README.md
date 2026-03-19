@@ -10,21 +10,15 @@ Rust (`stable`) and Node.js.
 
 ## Quick Start
 
-Run from the root of the project you want to analyze:
+From the Code Diver checkout:
 
 ```bash
 npm --prefix web install
 npm --prefix web run build
-cargo run -- --port 4000 --mcp-addr 127.0.0.1:4100
+cargo run -- <your-project-path> --port 4000 --mcp-addr 127.0.0.1:4100
 ```
 
-To analyze a different project path:
-
-```bash
-cargo run -- /path/to/project --port 4000 --mcp-addr 127.0.0.1:4100
-```
-
-Graph discovery is scoped to the selected root. If you launch from a subdirectory, files and metadata outside that subtree are excluded. Metadata discovery expects `.dive/overview.md` and `.dive/modules/*.md` under the chosen root.
+Graph discovery is scoped to the selected root. If you point Code Diver at a subdirectory, files and metadata outside that subtree are excluded. `.dive` metadata is optional; when present, Code Diver looks for `.dive/overview.md` and `.dive/modules/*.md` under the chosen root. Without `.dive`, the static graph still renders, but semantic groups, file narratives, and relationship context will be sparse or absent.
 
 ## Endpoints
 
@@ -36,7 +30,7 @@ MCP: `http://127.0.0.1:4100/mcp` (or your `--mcp-addr`)
 
 ## Current Implementation
 
-Code Diver currently ships a permissive `.dive` parser (with diagnostics), tree-sitter-backed static extraction (Rust, TypeScript, JavaScript, Python, Go), inferred static edges from imports/calls, a graph transform that blends semantic + static relations, and a read-only MCP surface for overview/group/module/file/trace/markdown/diagnostics.
+Code Diver currently ships a permissive `.dive` parser (with diagnostics), tree-sitter-backed static extraction (Rust, TypeScript, JavaScript, Python, Go), inferred static edges from imports/calls, a graph transform that blends semantic + static relations, and a read-only MCP surface for overview, group drilldown, module context, indexed `.dive` file context, relationship trace, markdown, and diagnostics.
 
 ## Dive Format (Consumed by Code Diver)
 
